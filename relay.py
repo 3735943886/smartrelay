@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-CA-swap 투명 릴레이 — 완전 동적. 도메인을 미리 알 필요 없다.
+CA-swap 투명 릴레이 + rules 기반 로컬(decloud) 응답 엔진 — 완전 동적. 도메인을 미리 알 필요 없다.
 
-PROTOCOL.md §4에서 실증된 성질을 이용한다:
+실측으로 확인된 다음 성질을 이용한다:
   - `:80`에서 내려주는 CA는 내용 검증이 없다 — 우리 CA를 그대로 심으면 기기가 새
     신뢰앵커로 설치한다. 단, 연결이 열리자마자 "즉시" 응답해야 한다(요청을 다 읽고
     나서 응답하면 거부됨 — 실측된 타이밍 특성). CA 자체는 도메인과 무관하므로
@@ -16,72 +16,53 @@ PROTOCOL.md §4에서 실증된 성질을 이용한다:
      도메인인지 알아낸다. 그 도메인용 리프 인증서가 없으면 그 자리에서 방금 만든
      CA로 서명해서 만들고(캐싱, 다음부턴 재사용), 그걸로 device 쪽 TLS를 종단한다.
   3) --dns로 지정한 DNS 서버에 그 도메인을 직접 질의해서 실제 IP를 얻는다.
-     성공하면 그 IP로(포트는 --port 매핑 참고) 재암호화 연결해서 투명 릴레이.
-     --dns를 안 줬거나 조회에 실패하면 업스트림 연결 없이 관찰만 한다(기기가
-     보내는 것만 캡처, 가장 안전).
+     성공하면 그 IP로(포트는 --port 매핑 참고) 재암호화 연결해서 투명 릴레이(**Proxy**).
+     --dns를 안 줬거나 조회에 실패하면 업스트림에 연결하지 않고, 대신 **rules/*.py**로
+     HTTP/MQTT를 직접 서빙한다(**Decloud**) — rules가 아무것도 응답 안 하면 그냥 관찰만.
+
+*** 엔진(이 파일)엔 기기별 하드코딩이 없다 ***
+"무엇에 어떻게 응답할지"는 전부 `rules/*.py`(파일명 알파벳순, 핫리로드) 소관 —
+계약은 rules_engine.py 참고. 이 엔진은 TLS 종단/HTTP·MQTT 프레이밍/DNS/rules 디스패치/
+observer(로컬 평문 주입 포트)만 담당한다.
 
 *** SNI를 안 보내는 기기가 실제로 있다(실측됨) ***
-임베디드 TLS 스택 중엔 ClientHello에 SNI 확장을 아예 안 넣는 경우가 흔하다. 이러면
-이 스크립트가 어떤 인증서를 줘야 할지 알 방법이 없어서 기본적으로 연결을 거부한다.
-이럴 땐 --default-domain 으로 SNI 없을 때 쓸 도메인을 지정해야 한다 — 그럼 인증서
-발급도, --dns 조회도 전부 그 도메인으로 처리한다.
+--default-domain 으로 SNI 없을 때 쓸 도메인을 지정할 것.
 
 *** 전제조건: DNS 리다이렉션이 반드시 필요하다 (기기 쪽) ***
-기기가 조회하는 도메인의 DNS 응답이 "이 스크립트를 돌리는 머신의 LAN IP"로
-나가야 한다 — 라우터/AP의 DNS를 바꾸거나(dnsmasq 등), 기기 트래픽이 지나는
-지점에서 DNS 스푸핑을 해야 한다. 이 스크립트 자체는 기기용 DNS 서버가 아니다. 예:
+기기가 조회하는 도메인의 DNS 응답이 "이 스크립트를 돌리는 머신의 LAN IP"로 나가야 한다.
 
-  # dnsmasq.conf — 기기가 붙는 모든 관련 도메인을 이 머신으로
-  address=/<대상 도메인>/<이 머신의 LAN IP>
+*** --dns는 "진짜" 조회처여야 한다 — 기기용 DNS 리다이렉션과 반대 역할, 헷갈리지 말 것 ***
 
-*** --dns는 "진짜" 조회처여야 한다 — 위 dnsmasq와 헷갈리지 말 것 ***
---dns <IP>는 이 스크립트가 실제 업스트림 IP를 알아내려고 직접 질의하는 서버다.
-위 dnsmasq(기기용, 조작된 답을 줌)와는 **정반대** 역할 — 절대 같은 서버를 넣지
-말 것(넣으면 우리 자신의 조작된 답을 되돌려받아 자기 자신에게 연결하려 하게 됨).
-보통은 `8.8.8.8` 같은 공용 DNS나, 대상 도메인의 진짜 권위 서버를 쓴다.
-
-*** 전제조건: 포트 독점 필요 + 관리자 권한 ***
---http-port(기본 80)와 --port로 지정하는 모든 로컬 포트는 이 스크립트가 그
-호스트에서 단독으로 bind/listen 해야 한다(공유 불가, 포트당 리스너 하나). 80/443
-처럼 1024 미만 포트는 대부분 OS에서 관리자 권한이 필요하다(Linux는 sudo 또는
-setcap cap_net_bind_service=+ep).
+*** 전제조건: 포트 독점 필요 + 관리자 권한 (1024 미만 포트) ***
 
 *** 전제조건: provision.py보다 먼저 떠 있어야 한다 ***
-`provision.py reset`으로 기기를 리셋하면 기기는 곧바로 DNS 조회 -> CA 다운로드
--> TLS 핸드셰이크를 시도하고, 실패하면 몇 차례 지수 백오프 후 완전히 재시도를
-포기한다(PROTOCOL.md §3). DNS 리다이렉션과 이 스크립트(relay.py serve)가 먼저
-떠 있는 상태에서 provision.py로 reset을 트리거해야 한다.
 
 *** 안전 ***
---dns를 지정하면(관찰 모드가 아니면) 실제 서버의 응답을 그대로 기기에 돌려준다.
-그 응답에 펌웨어/OTA 지시가 섞여 있으면 그대로 전달된다 — 화면 로그를 보며
-수상한 응답이 보이면 즉시 프로세스를 죽일 것.
+Proxy 모드(--dns 지정)에서는 실서버 응답이 그대로 기기에 전달된다. 화면 로그를 보면서
+수상한 응답(펌웨어/OTA 지시 등)이 보이면 즉시 프로세스를 죽일 것 — 자동 차단은 없다.
 
-*** 로그 ***
-화면에는 연결/인증서 발급/DNS 조회/릴레이 시작/종료 같은 요약 정보만 실시간으로
-찍힌다. 실제 바이트 단위 상세 캡처는 화면이 아니라 --log-dir 아래 파일로 남는다
-(연결마다 device_to_upstream.bin / upstream_to_device.bin).
+*** observer / 로컬 주입 + 실시간 관찰 ***
+--observer HOST:PORT 를 주면 평문 MQTT 리스너를 하나 더 연다(로컬신뢰망 전용, 반드시 방화벽
+으로 보호할 것). 여기 붙은 클라이언트는 두 가지를 한다:
+  1) 관찰 — 접속해있는 동안 기기 세션(:18831, Proxy든 Decloud든)에 오가는 모든 MQTT
+     PUBLISH를 그대로 tap받는다(파일 캡처 없이 실시간으로 보는 용도).
+  2) 주입 — PUBLISH한 JSON 커맨드(예: {"outlet":1,"on":true})가 rules/*.py의
+     on_local_inject()로 번역되어 실제 기기 세션에 그대로 들어간다. 아직 실증 안 된
+     device_control 첫 시도가 여기서 나가므로 반드시 관찰하면서 시험할 것.
+
+*** 파일 캡처는 기본 꺼짐 ***
+--log-dir 을 명시적으로 줄 때만 device_to_upstream.bin/upstream_to_device.bin 로 저장한다.
+평소엔 위 observer로 필요할 때만 들여다볼 것 — 디스크에 아무것도 안 남기는 게 기본값이다.
 
 사용:
-  # 포트만 열고 관찰만 (가장 안전, --dns 없음). SNI 보내는 기기라면 이걸로 충분.
-  python3 relay.py serve -p 443
-
-  # SNI를 안 보내는 기기 — 기본 도메인을 직접 지정
-  python3 relay.py serve -p 443 --default-domain <대상 도메인>
-
-  # 여러 포트, 실제 DNS로 업스트림 찾아서 릴레이
-  python3 relay.py serve -p 443 -p 8883 --default-domain <대상 도메인> --dns 8.8.8.8
-
-  # 로컬 18883으로 받은 걸 업스트림 8883으로 보내기(비표준 로컬 포트 -> 표준 포트)
-  python3 relay.py serve -p 18883:8883 --default-domain <대상 도메인> --dns 8.8.8.8
-
-  python3 relay.py gen-ca --force      # 루트 CA만 강제 재생성
+  python3 relay.py serve -p 80... (아래 예시는 --help 참고)
+  python3 relay.py gen-ca --force
 """
 
 import argparse
+import json
 import os
 import random
-import re
 import socket
 import ssl
 import struct
@@ -90,11 +71,17 @@ import sys
 import tempfile
 import threading
 import time
+from dataclasses import dataclass
+from typing import Optional
+
+import mqtt_session
+import mqtt_wire as mw
+from rules_engine import HttpResponse, RulesHandle
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 DEFAULT_CERT_DIR = os.path.join(SCRIPT_DIR, "certs")
-DEFAULT_LOG_DIR = os.path.join(SCRIPT_DIR, "captures")
+DEFAULT_RULES_DIR = os.path.join(SCRIPT_DIR, "rules")
 
 _leaf_lock = threading.Lock()
 
@@ -145,7 +132,13 @@ def _sanitize(domain: str) -> str:
 
 
 def get_or_make_leaf(cert_dir: str, domain: str, days: int = 825):
-    """domain 하나짜리 SAN 리프를 CA로 서명해서 만들고(없으면), (chain_pem, key) 경로를 돌려준다."""
+    """domain 하나짜리 SAN 리프를 CA로 서명해서 만들고(없으면), (chain_pem, key) 경로를 돌려준다.
+
+    *** RSA 고정 *** — 실기기가 TLS_RSA_WITH_AES_256_CBC_SHA256(static RSA 키교환, ECDHE 없음)
+    만 협상하는 게 실측 확인됨. openssl
+    기본 genrsa라 문제없지만, 다른 도구로 교체할 때 EC key로 바꾸면 핸드셰이크 자체가
+    안 된다 — 절대 EC/Ed25519로 바꾸지 말 것.
+    """
     leaf_dir = os.path.join(cert_dir, "leaves")
     os.makedirs(leaf_dir, exist_ok=True)
     safe = _sanitize(domain)
@@ -260,8 +253,7 @@ def _dns_query_once(domain: str, dns_server: str, timeout: float):
 
 
 def resolve_via_dns(domain: str, dns_server: str, timeout: float = 3.0, max_hops: int = 5):
-    """--dns 서버에 직접 A 레코드 질의(표준 라이브러리 raw UDP). CNAME은 따라감.
-    실패하면 None."""
+    """--dns 서버에 직접 A 레코드 질의(표준 라이브러리 raw UDP). CNAME은 따라감. 실패하면 None."""
     current = domain
     for _ in range(max_hops):
         try:
@@ -288,6 +280,99 @@ def ts():
 def log(cid, msg):
     print(f"[{ts()}] [{cid}] {msg}")
     sys.stdout.flush()
+
+
+# ---------------------------------------------------------------------------
+# 살아있는 기기 MQTT 세션 레지스트리 — observer 주입 대상 조회용.
+# 로컬(가정용) 배포 전제라 client_id로 키잉하되 "가장 최근 세션"도 별도로 기억해서
+# observer가 대상을 안 밝혀도 기본으로 거기에 주입한다.
+# ---------------------------------------------------------------------------
+
+class DeviceRegistry:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._sessions = {}  # client_id(bytes) -> (sock, write_lock)
+        self._latest = None  # client_id(bytes)
+
+    def register(self, client_id: bytes, sock, write_lock: threading.Lock):
+        with self._lock:
+            self._sessions[client_id] = (sock, write_lock)
+            self._latest = client_id
+        log("registry", f"기기 세션 등록: {client_id!r}")
+
+    def unregister(self, client_id: bytes):
+        with self._lock:
+            self._sessions.pop(client_id, None)
+            if self._latest == client_id:
+                self._latest = next(reversed(self._sessions), None)
+        log("registry", f"기기 세션 해제: {client_id!r}")
+
+    def get(self, client_id: Optional[bytes] = None):
+        with self._lock:
+            cid = client_id or self._latest
+            if cid is None:
+                return None
+            return self._sessions.get(cid)
+
+    def latest_client_id(self) -> Optional[bytes]:
+        with self._lock:
+            return self._latest
+
+
+DEVICE_REGISTRY = DeviceRegistry()
+
+
+# ---------------------------------------------------------------------------
+# tap 버스 — observer에 접속해있는 동안 기기 세션의 실제 MQTT PUBLISH를 그대로
+# 실시간으로 흘려보낸다(파일 캡처 없이 관찰하는 용도, --log-dir과 무관하게 항상 동작).
+# ---------------------------------------------------------------------------
+
+class TapBus:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._subs = {}  # id(sock) -> (sock, write_lock)
+
+    def subscribe(self, sock, write_lock: threading.Lock):
+        with self._lock:
+            self._subs[id(sock)] = (sock, write_lock)
+
+    def unsubscribe(self, sock):
+        with self._lock:
+            self._subs.pop(id(sock), None)
+
+    def publish(self, topic: bytes, payload: bytes):
+        with self._lock:
+            subs = list(self._subs.values())
+        pkt = mw.build_publish(topic, payload, qos=0)
+        for sock, write_lock in subs:
+            try:
+                with write_lock:
+                    sock.sendall(pkt.bytes())
+            except Exception:
+                pass  # 죽은 observer 연결 — on_close가 알아서 정리함
+
+
+TAP = TapBus()
+
+
+@dataclass
+class Ctx:
+    cid: str
+    domain: Optional[str] = None
+    client_id: Optional[bytes] = None
+    device_client_id: Optional[bytes] = None
+
+
+def _send_specs_to(sock, write_lock: threading.Lock, specs, pid_counter: "list[int]", log_prefix: str):
+    for spec in specs or []:
+        with write_lock:
+            pid = None
+            if spec.qos > 0:
+                pid_counter[0] = (pid_counter[0] % 0xFFFF) + 1
+                pid = pid_counter[0]
+            pkt = mw.build_publish(spec.topic, spec.payload, qos=spec.qos, packet_id=pid)
+            sock.sendall(pkt.bytes())
+        log(log_prefix, f">>> PUBLISH {spec.topic.decode(errors='replace')} ({len(spec.payload)}B)")
 
 
 # ---------------------------------------------------------------------------
@@ -361,28 +446,39 @@ def listen80(ls: socket.socket, ca_pem):
 
 
 # ---------------------------------------------------------------------------
-# TLS 포트 — SNI로 도메인 학습 -> 리프 즉석 발급 -> (있으면) DNS로 실제 IP 찾아 릴레이
+# TLS 포트 — SNI로 도메인 학습 -> 리프 즉석 발급
+#   업스트림 있음(Proxy): 기존 순수 byte relay + capture, device->upstream 방향만
+#     살짝 tee해서 MQTT CONNECT의 client_id를 registry에 등록(observer 주입 대상 확보용).
+#   업스트림 없음(Decloud): HTTP/MQTT 프로토콜을 직접 스니핑해서 rules로 서빙.
 # ---------------------------------------------------------------------------
 
-# --- TEMP-FWR-KILL: whitelist된 현재 버전 파일명은 통과, 그 외 .fwr 또는 url 필드가 채워진
-# 응답은 위험(OTA push)으로 보고 차단(임시, 나중에 삭제) ---
-_FWR_WHITELIST = {b"MTTL-W01_V1.0.60.fwr"}
-_FWR_RE = re.compile(rb'[\w./-]*\.fwr', re.IGNORECASE)
-_URL_RE = re.compile(rb'"url"\s*:\s*"([^"]+)"')
+class _ProxyTap:
+    """Proxy 모드에서 한쪽 방향의 raw 바이트를 tee해서, CONNECT 패킷이 완성되면 client_id를
+    registry에 등록하고, PUBLISH는 TAP으로 흘려서 observer가 실시간으로 볼 수 있게 한다
+    (Proxy 모드는 rules를 안 타므로 여기가 유일한 관찰 지점). MQTT가 아닌 트래픽(:443
+    HTTP 등)이면 그냥 아무 일도 안 함."""
+
+    def __init__(self, dev_sock, write_lock):
+        self.framer = mw.Framer()
+        self.dev_sock = dev_sock
+        self.write_lock = write_lock
+        self.client_id = None
+
+    def feed(self, data: bytes):
+        try:
+            for pkt in self.framer.push(data):
+                if pkt.kind == mw.CONNECT and self.client_id is None:
+                    info = mw.parse_connect(pkt.body)
+                    self.client_id = info.client_id
+                    DEVICE_REGISTRY.register(self.client_id, self.dev_sock, self.write_lock)
+                elif pkt.kind == mw.PUBLISH:
+                    info = mw.parse_publish(pkt)
+                    TAP.publish(info.topic, info.payload)
+        except Exception:
+            pass  # MQTT가 아닌 트래픽으로 판단, 조용히 무시
 
 
-def _fwr_kill_reason(data: bytes):
-    for m in _FWR_RE.finditer(data):
-        if m.group(0) not in _FWR_WHITELIST:
-            return f".fwr 파일명({m.group(0).decode(errors='replace')})"
-    m = _URL_RE.search(data)
-    if m and m.group(1):
-        return f"url 필드({m.group(1).decode(errors='replace')})"
-    return None
-# --- TEMP-FWR-KILL helper end ---
-
-
-def pump(src, dst, label, cid, fp):
+def pump(src, dst, label, cid, fp, tee=None, write_lock: Optional[threading.Lock] = None):
     total = 0
     try:
         while True:
@@ -394,13 +490,14 @@ def pump(src, dst, label, cid, fp):
                 fp.write(data)
                 fp.flush()
             log(cid, f"{label} +{len(data)}B (누적 {total}B)")
-            if label == "upstream->device":
-                reason = _fwr_kill_reason(data)
-                if reason:
-                    log(cid, f"!!! {label}에서 위험 신호 감지({reason}) — 기기로 전달하지 않고 프로세스 종료 !!!")
-                    os._exit(1)
+            if tee is not None:
+                tee(data)
             if dst is not None:
-                dst.sendall(data)
+                if write_lock is not None:
+                    with write_lock:
+                        dst.sendall(data)
+                else:
+                    dst.sendall(data)
     except Exception as e:
         log(cid, f"{label} 종료: {e}")
     finally:
@@ -412,7 +509,114 @@ def pump(src, dst, label, cid, fp):
     return total
 
 
-def handle_tls(raw_client, addr, local_port, remote_port, cert_dir, dns_server, port_domain, default_domain, log_dir):
+# --- Decloud(업스트림 없음) 로컬 서빙: 프로토콜 스니핑 후 HTTP 또는 MQTT로 rules 디스패치 ---
+
+_HTTP_METHODS = (b"GET", b"POST", b"PUT", b"HEAD", b"DELETE")
+
+
+def _looks_like_http(first: bytes) -> bool:
+    return any(first.startswith(m + b" ") for m in _HTTP_METHODS)
+
+
+def _looks_like_mqtt_connect(first: bytes) -> bool:
+    return len(first) >= 1 and (first[0] >> 4) == mw.CONNECT
+
+
+def serve_http_locally(dev_tls, cid, ctx, rules: RulesHandle, first: bytes, fp_dev):
+    buf = bytearray(first)
+    deadline = time.time() + 5.0
+    while b"\r\n\r\n" not in buf and time.time() < deadline:
+        dev_tls.settimeout(max(0.1, deadline - time.time()))
+        try:
+            chunk = dev_tls.recv(65536)
+        except socket.timeout:
+            break
+        if not chunk:
+            break
+        buf.extend(chunk)
+    if fp_dev:
+        fp_dev.write(bytes(buf))
+        fp_dev.flush()
+    if b"\r\n\r\n" not in buf:
+        log(cid, "HTTP 헤더 미완성 — 종료")
+        return
+
+    head, _, rest = bytes(buf).partition(b"\r\n\r\n")
+    lines = head.split(b"\r\n")
+    try:
+        method, path, _ = lines[0].split(b" ", 2)
+    except ValueError:
+        log(cid, f"HTTP 요청줄 파싱 실패: {lines[0]!r}")
+        return
+    headers = {}
+    for line in lines[1:]:
+        if b":" in line:
+            k, v = line.split(b":", 1)
+            headers[k.strip().decode(errors="replace")] = v.strip().decode(errors="replace")
+    content_length = int(headers.get("Content-Length", "0") or "0")
+    body = bytearray(rest)
+    while len(body) < content_length and time.time() < deadline:
+        dev_tls.settimeout(max(0.1, deadline - time.time()))
+        try:
+            chunk = dev_tls.recv(65536)
+        except socket.timeout:
+            break
+        if not chunk:
+            break
+        body.extend(chunk)
+        if fp_dev:
+            fp_dev.write(chunk)
+            fp_dev.flush()
+
+    log(cid, f"HTTP {method.decode(errors='replace')} {path.decode(errors='replace')} "
+             f"(body {len(body)}B)")
+    resp: Optional[HttpResponse] = rules.on_http_request(ctx, method, path, headers, bytes(body))
+    if resp is None:
+        log(cid, "rules 응답 없음 — 종료")
+        return
+    header_lines = "".join(f"{k}: {v}\r\n" for k, v in resp.headers.items())
+    header_lines += f"Content-Length: {len(resp.body)}\r\n"
+    out = resp.status_line + b"\r\n" + header_lines.encode() + b"\r\n" + resp.body
+    dev_tls.sendall(out)
+    log(cid, f"rules 응답 전송 ({len(out)}B)")
+
+
+def serve_mqtt_locally(dev_tls, cid, ctx, rules: RulesHandle, first: bytes, fp_dev):
+    write_lock = threading.Lock()
+
+    def on_connect(session):
+        ctx.client_id = session.client_id
+        DEVICE_REGISTRY.register(session.client_id, dev_tls, write_lock)
+
+    def on_subscribed(session):
+        return rules.on_session_start(ctx) or None
+
+    def on_publish(session, topic, payload, qos):
+        TAP.publish(topic, payload)
+        try:
+            msg = json.loads(payload)
+        except Exception:
+            log(cid, f"JSON 파싱 실패, topic={topic!r}")
+            return None
+        specs = rules.on_message(ctx, msg, topic)
+        for spec in specs or []:
+            TAP.publish(spec.topic, spec.payload)
+        return specs
+
+    def on_close(session):
+        if session.client_id:
+            DEVICE_REGISTRY.unregister(session.client_id)
+
+    mqtt_session.run_server_session(
+        dev_tls, cid, lambda m: log(cid, m),
+        on_connect=on_connect, on_subscribed=on_subscribed,
+        on_publish=on_publish, on_close=on_close,
+        initial_data=first, write_lock=write_lock, capture_fp=fp_dev,
+    )
+
+
+def handle_tls(raw_client, addr, local_port, remote_port, cert_dir, dns_server, port_domain,
+               default_domain, log_dir, rules: RulesHandle):
     cid = f":{local_port}-{addr[0]}:{addr[1]}-{int(time.time())}"
     log(cid, f"{addr[0]}에서 :{local_port} 연결(TLS)")
 
@@ -445,6 +649,7 @@ def handle_tls(raw_client, addr, local_port, remote_port, cert_dir, dns_server, 
 
     domain = sni_holder.get("value")
     log(cid, f"TLS 성공(도메인={domain!r}, cipher={dev_tls.cipher()}) — 기기가 인증서를 신뢰함")
+    ctx = Ctx(cid=cid, domain=domain)
 
     up_tls = None
     if dns_server and domain:
@@ -453,35 +658,68 @@ def handle_tls(raw_client, addr, local_port, remote_port, cert_dir, dns_server, 
             log(cid, f"DNS({dns_server})로 {domain} 조회 -> {real_ip}")
             try:
                 raw_up = socket.create_connection((real_ip, remote_port), timeout=15)
-                raw_up.settimeout(None)  # connect용 타임아웃일 뿐 — MQTT는 무통신 idle이 흔해서 이후엔 blocking으로 풀어줌
+                raw_up.settimeout(None)
                 up_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
                 up_ctx.check_hostname = False
                 up_ctx.verify_mode = ssl.CERT_NONE
                 up_tls = up_ctx.wrap_socket(raw_up, server_hostname=domain)
-                log(cid, f"{real_ip}:{remote_port}(SNI={domain})로 릴레이 시작")
+                log(cid, f"{real_ip}:{remote_port}(SNI={domain})로 릴레이 시작(Proxy)")
             except Exception as e:
-                log(cid, f"업스트림({real_ip}:{remote_port}) 연결 실패: {e} — 관찰 전용으로 계속")
+                log(cid, f"업스트림({real_ip}:{remote_port}) 연결 실패: {e} — Decloud로 폴백")
                 up_tls = None
         else:
-            log(cid, f"DNS({dns_server})로 {domain} 조회 실패 — 관찰 전용으로 계속")
+            log(cid, f"DNS({dns_server})로 {domain} 조회 실패 — Decloud로 폴백")
     elif not dns_server:
-        log(cid, "관찰 전용(--dns 없음) — 업스트림에 연결하지 않음")
+        log(cid, "--dns 없음 — Decloud(rules 직접 서빙)")
 
-    os.makedirs(log_dir, exist_ok=True)
-    fp_dev = open(os.path.join(log_dir, f"{cid}_device_to_upstream.bin"), "wb")
-    fp_up = open(os.path.join(log_dir, f"{cid}_upstream_to_device.bin"), "wb") if up_tls else None
+    fp_dev = fp_up = None
+    if log_dir:
+        os.makedirs(log_dir, exist_ok=True)
+        fp_dev = open(os.path.join(log_dir, f"{cid}_device_to_upstream.bin"), "wb")
 
-    threads = [threading.Thread(target=pump, args=(dev_tls, up_tls, "device->upstream", cid, fp_dev))]
     if up_tls is not None:
-        threads.append(threading.Thread(target=pump, args=(up_tls, dev_tls, "upstream->device", cid, fp_up)))
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
+        # --- Proxy: 기존 순수 relay, 양방향을 tee해서 registry 등록 + TAP으로 흘림 ---
+        if log_dir:
+            fp_up = open(os.path.join(log_dir, f"{cid}_upstream_to_device.bin"), "wb")
+        write_lock = threading.Lock()
+        tee_down = _ProxyTap(dev_tls, write_lock)  # device->upstream (CONNECT 등록도 여기서)
+        tee_up = _ProxyTap(dev_tls, write_lock)    # upstream->device (등록 없이 tap만)
+        threads = [
+            threading.Thread(target=pump, args=(dev_tls, up_tls, "device->upstream", cid, fp_dev),
+                              kwargs={"tee": tee_down.feed}),
+            threading.Thread(target=pump, args=(up_tls, dev_tls, "upstream->device", cid, fp_up),
+                              kwargs={"write_lock": write_lock, "tee": tee_up.feed}),
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        if fp_up:
+            fp_up.close()
+        if tee_down.client_id:
+            DEVICE_REGISTRY.unregister(tee_down.client_id)
+    else:
+        # --- Decloud: 프로토콜 스니핑 후 rules로 직접 서빙 ---
+        try:
+            dev_tls.settimeout(5.0)
+            first = dev_tls.recv(65536)
+        except Exception as e:
+            log(cid, f"첫 데이터 수신 실패: {e}")
+            first = b""
+        if not first:
+            log(cid, "데이터 없음 — 종료")
+        elif _looks_like_http(first):
+            serve_http_locally(dev_tls, cid, ctx, rules, first, fp_dev)
+        elif _looks_like_mqtt_connect(first):
+            serve_mqtt_locally(dev_tls, cid, ctx, rules, first, fp_dev)
+        else:
+            log(cid, f"알 수 없는 프로토콜(첫 바이트 {first[:4].hex()}) — 관찰만 하고 종료")
+            if fp_dev:
+                fp_dev.write(first)
+                fp_dev.flush()
 
-    fp_dev.close()
-    if fp_up:
-        fp_up.close()
+    if fp_dev:
+        fp_dev.close()
     for s in (dev_tls, up_tls):
         if s is not None:
             try:
@@ -491,7 +729,8 @@ def handle_tls(raw_client, addr, local_port, remote_port, cert_dir, dns_server, 
     log(cid, "연결 종료")
 
 
-def listen_tls(ls: socket.socket, local_port, remote_port, cert_dir, dns_server, port_domain, default_domain, log_dir):
+def listen_tls(ls: socket.socket, local_port, remote_port, cert_dir, dns_server, port_domain,
+               default_domain, log_dir, rules: RulesHandle):
     domain_note = f", SNI 없을 때 기본 도메인={port_domain}" if port_domain else ""
     print(f"listening {ls.getsockname()[0]}:{local_port} — device TLS 종단"
           f"{'' if local_port == remote_port else f' (업스트림 포트는 :{remote_port})'}{domain_note}")
@@ -500,9 +739,64 @@ def listen_tls(ls: socket.socket, local_port, remote_port, cert_dir, dns_server,
         c, a = ls.accept()
         threading.Thread(
             target=handle_tls,
-            args=(c, a, local_port, remote_port, cert_dir, dns_server, port_domain, default_domain, log_dir),
+            args=(c, a, local_port, remote_port, cert_dir, dns_server, port_domain,
+                  default_domain, log_dir, rules),
             daemon=True,
         ).start()
+
+
+# ---------------------------------------------------------------------------
+# observer — 평문 로컬 MQTT 리스너, 외부 도구의 명령을 실제 기기 세션에 주입
+# ---------------------------------------------------------------------------
+
+def handle_observer_conn(client, addr, rules: RulesHandle):
+    cid = f"observer-{addr[0]}:{addr[1]}-{int(time.time())}"
+    log(cid, f"observer 연결")
+    write_lock = threading.Lock()
+
+    def on_connect(session):
+        TAP.subscribe(client, write_lock)
+
+    def on_close(session):
+        TAP.unsubscribe(client)
+
+    def on_publish(session, topic, payload, qos):
+        try:
+            cmd = json.loads(payload)
+        except Exception:
+            log(cid, f"JSON 파싱 실패: {payload!r}")
+            return None
+        target_client_id = cmd.get("device_client_id", "").encode() if cmd.get("device_client_id") else None
+        entry = DEVICE_REGISTRY.get(target_client_id)
+        if entry is None:
+            log(cid, "주입 대상 기기 세션 없음(연결된 기기 없음) — 무시")
+            return None
+        dev_sock, write_lock = entry
+        inj_ctx = Ctx(cid=cid, device_client_id=target_client_id or DEVICE_REGISTRY.latest_client_id())
+        specs = rules.on_local_inject(inj_ctx, cmd)
+        if not specs:
+            log(cid, "rules.on_local_inject 응답 없음")
+            return None
+        _send_specs_to(dev_sock, write_lock, specs, [0], cid)
+        return None  # observer 자신에게는 별도 응답 없음(로그로 충분)
+
+    mqtt_session.run_server_session(
+        client, cid, lambda m: log(cid, m),
+        on_connect=on_connect, on_publish=on_publish, on_close=on_close,
+        write_lock=write_lock,
+    )
+    try:
+        client.close()
+    except Exception:
+        pass
+
+
+def listen_observer(ls: socket.socket, rules: RulesHandle):
+    print(f"listening {ls.getsockname()[0]}:{ls.getsockname()[1]} — observer(평문 MQTT, 로컬주입)")
+    sys.stdout.flush()
+    while True:
+        c, a = ls.accept()
+        threading.Thread(target=handle_observer_conn, args=(c, a, rules), daemon=True).start()
 
 
 # ---------------------------------------------------------------------------
@@ -545,10 +839,16 @@ def cmd_serve(args):
     # bind는 여기(메인 스레드)에서 미리 해서, 실패하면 스레드 없이 바로 죽는다.
     http_ls = bind_listener(args.listen_host, args.http_port)
     tls_listeners = {local: bind_listener(args.listen_host, local) for local in ports}
+    observer_ls = None
+    if args.observer:
+        ohost, oport = args.observer.rsplit(":", 1)
+        observer_ls = bind_listener(ohost or "0.0.0.0", int(oport))
 
     ca_crt, _ = ensure_ca(args.cert_dir)
     with open(ca_crt, "rb") as f:
         ca_pem = f.read()
+
+    rules = RulesHandle(args.rules_dir) if args.rules_dir else RulesHandle.empty()
 
     print("=" * 70)
     print("DNS 리다이렉션 확인: 대상 도메인 조회가 이 머신으로 오고 있어야 동작합니다.")
@@ -558,11 +858,14 @@ def cmd_serve(args):
     if args.default_domain:
         print(f"SNI 없는 연결의 기본 도메인: {args.default_domain}")
     if args.dns:
-        print(f"업스트림: --dns {args.dns} 로 실제 IP를 조회해서 릴레이")
+        print(f"업스트림: --dns {args.dns} 로 실제 IP를 조회해서 릴레이(Proxy) — 실패시 Decloud 폴백")
         print(f"  (주의: {args.dns}가 기기용 DNS 리다이렉션과 같은 서버면 안 됨)")
     else:
-        print("업스트림: 없음(--dns 미지정) — 관찰 전용, 기기가 보내는 것만 캡처")
-    print(f"캡처 저장 위치: {args.log_dir}")
+        print("업스트림: 없음(--dns 미지정) — 전부 Decloud(rules가 직접 응답)")
+    print(f"rules 디렉터리: {args.rules_dir or '(비활성화)'}")
+    if observer_ls:
+        print(f"observer: {observer_ls.getsockname()}")
+    print(f"파일 캡처: {args.log_dir if args.log_dir else '꺼짐(--log-dir로 지정하면 켜짐)'}")
     print("=" * 70)
     sys.stdout.flush()
 
@@ -571,9 +874,11 @@ def cmd_serve(args):
         threads.append(threading.Thread(
             target=listen_tls,
             args=(tls_listeners[local], local, cfg["remote"], args.cert_dir, args.dns,
-                  cfg["domain"], args.default_domain, args.log_dir),
+                  cfg["domain"], args.default_domain, args.log_dir, rules),
             daemon=True,
         ))
+    if observer_ls:
+        threads.append(threading.Thread(target=listen_observer, args=(observer_ls, rules), daemon=True))
     for t in threads:
         t.start()
     for t in threads:
@@ -600,21 +905,25 @@ def main():
         help="TLS로 종단할 로컬 포트. 반복 또는 콤마로 여러 개. "
              "'PORT'(로컬=업스트림 같은 포트), 'LOCAL:REMOTE'(예: 18883:8883), 또는 "
              "'LOCAL:REMOTE:DOMAIN'(그 포트에서 SNI 없을 때 쓸 기본 도메인 지정, "
-             "--default-domain보다 우선). 예: -p 443 -p 18883:18883:brk2.onem2m.uplus.co.kr",
+             "--default-domain보다 우선). 예: -p 443 -p 18831:18831:example.com",
     )
     p_serve.add_argument(
         "--dns", default=None,
-        help="실제 업스트림 IP를 조회할 DNS 서버(예: 8.8.8.8). 안 주면 업스트림에 "
-             "전혀 연결하지 않고 관찰만 함(가장 안전). 기기용 DNS 리다이렉션 서버와 "
-             "절대 같으면 안 됨.",
+        help="실제 업스트림 IP를 조회할 DNS 서버(예: 8.8.8.8). 안 주면(또는 조회 실패시) "
+             "Decloud로 폴백(rules가 직접 응답). 기기용 DNS 리다이렉션 서버와 절대 같으면 안 됨.",
     )
     p_serve.add_argument(
         "--default-domain", default=None,
         help="ClientHello에 SNI가 없는 기기를 위한 전역 기본 도메인(인증서 발급 + --dns 조회에 "
-             "그대로 씀). -p로 그 포트의 도메인을 따로 지정하지 않은 경우의 fallback. "
-             "SNI도 없고 이것도 없고 포트별 도메인도 없으면 연결을 거부한다.",
+             "그대로 씀). -p로 그 포트의 도메인을 따로 지정하지 않은 경우의 fallback.",
     )
-    p_serve.add_argument("--log-dir", default=DEFAULT_LOG_DIR)
+    p_serve.add_argument("--rules-dir", default=DEFAULT_RULES_DIR,
+                          help="rules/*.py 디렉터리(빈 문자열로 주면 비활성화 — 순수 관찰/릴레이만)")
+    p_serve.add_argument("--observer", default=None,
+                          help="평문 MQTT 로컬주입 리스너 HOST:PORT (예: 127.0.0.1:9883)")
+    p_serve.add_argument("--log-dir", default=None,
+                          help="지정하면 연결별로 device_to_upstream.bin/upstream_to_device.bin "
+                               "파일 캡처를 남긴다(기본은 꺼짐 — 필요할 땐 --observer로 실시간 관찰).")
     p_serve.set_defaults(func=cmd_serve)
 
     args = p.parse_args()

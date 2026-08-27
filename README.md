@@ -1,11 +1,17 @@
-## 이 리포의 목표
+## 이 리포가 하는 일
 
-1. **프로비저닝** — SoftAP `LGAPMODE` 프로토콜로 기기에 홈 WiFi 자격증명 주입 (`provision.py`, 완료)
-2. **투명 릴레이** — 기기가 원하는 목적지로 향하게, 우리 CA/리프로 기기측을 종단하고
-   업스트림은 직접 지정한 실제 목적지로 재암호화 중계 (`relay.py`, 완료 — 원리는
-   PROTOCOL.md §4 "실제 LGU+ MEF까지 양방향 MITM"에서 실증됨)
+1. **프로비저닝** — SoftAP `LGAPMODE` 프로토콜로 기기에 홈 WiFi 자격증명 주입 (`provision.py`)
+2. **투명 릴레이(Proxy)** — 기기가 원하는 목적지로 향하게, 우리 CA/리프로 기기측을 종단하고
+   업스트림은 직접 지정한 실제 목적지로 재암호화 중계 (`relay.py`)
 3. **양방향 패킷 캡처** — 위 릴레이를 통과하는 평문 트래픽을 양방향으로 파일 로깅
-   (`relay.py`, 완료). oneM2M/MQTT 브로커 프로토콜을 완전히 문서화하는 건 계속 진행 중.
+   (`relay.py`, `--log-dir` 지정시). oneM2M/MQTT 브로커 프로토콜 문서화는 계속 진행 중.
+4. **로컬 전용(Decloud) + observer 주입** — `--dns`를 안 주면(또는 조회 실패시)
+   업스트림 없이 `relay.py`가 `rules/*.py`(응답 규칙 계약은 `rules_engine.py`)로
+   HTTP(`:80`/`:443`)와 MQTT(`:18831`)를 직접 서빙한다 — 실서버 없이
+   기기가 정상 동작. `--observer HOST:PORT`로 평문 MQTT 로컬주입 포트를 열면 외부 도구가
+   보낸 명령(`{"outlet":1,"on":true}`)이 실제 기기 세션에 oneM2M `device_control`로
+   주입된다(Proxy/Decloud 둘 다 지원). 자세한 계약은 `rules_engine.py` 상단 docstring,
+   기기별 응답 값은 `rules/99-default.py` 참고.
 
 ---
 
@@ -44,17 +50,19 @@ python3 provision.py info --wait 30
 
 ## 2. 투명 릴레이 & 양방향 패킷 캡처 — `relay.py`
 
-기기가 프로비저닝 후 신뢰하는 CA를 우리 것으로 교체(PROTOCOL.md §4)하면, 기기는
-우리가 세운 TLS 종단을 실제 서버로 착각한다. `relay.py`는 도메인을 미리 몰라도
-된다 — **완전 동적**이다:
+기기가 프로비저닝 후 신뢰하는 CA를 우리 것으로 교체하면, 기기는 우리가 세운
+TLS 종단을 실제 서버로 착각한다. `relay.py`는 도메인을 미리 몰라도 된다 —
+**완전 동적**이다:
 
 1. 루트 CA를 한 번만 만들어서 계속 재사용(`--cert-dir`에 저장).
 2. TLS 연결이 들어오면 `ClientHello`의 **SNI**(암호화되기 전 평문 필드)로 어떤
    도메인인지 알아낸다. 그 도메인용 리프 인증서가 없으면 그 자리에서 그 CA로
    서명해 만들고(캐싱, 다음부턴 재사용) 그걸로 device 쪽 TLS를 종단한다.
 3. `--dns`로 지정한 DNS 서버에 그 도메인을 직접 질의해서 실제 IP를 얻는다.
-   성공하면 그 IP로 재암호화 연결해서 투명 릴레이. `--dns`를 안 줬거나 조회에
-   실패하면 업스트림 연결 없이 관찰만 한다(기기가 보내는 것만 캡처, 가장 안전).
+   성공하면 그 IP로 재암호화 연결해서 투명 릴레이(**Proxy**). `--dns`를 안 줬거나
+   조회/연결에 실패하면 업스트림 없이 **Decloud**로 폴백한다 — `rules/*.py`가 직접
+   HTTP/MQTT를 서빙(아래 "로컬 전용(Decloud)" 절 참고). rules가 아무것도 응답 안 하면
+   그냥 관찰만(가장 안전).
 
 즉 도메인을 몇 개 미리 나열할 필요가 없다 — 뭐가 오든 SNI로 배우고, 실제
 목적지는 그때그때 DNS로 찾는다.
@@ -114,9 +122,9 @@ address=/<대상 도메인>/<relay.py를 실행하는 머신의 LAN IP>
 
 `provision.py reset`으로 기기를 리셋하면 기기는 곧바로 DNS 조회 → CA 다운로드
 → TLS 핸드셰이크를 시도하고, 실패하면 몇 차례 지수 백오프 후 완전히 재시도를
-포기한다(PROTOCOL.md §3). **DNS 리다이렉션과 `relay.py serve`가 먼저 떠 있는
-상태에서** `provision.py reset`을 트리거해야 한다 — 순서가 바뀌면 기기가 재시도를
-다 소진해버리고, 다시 잡으려면 SoftAP 재프로비저닝부터 반복해야 한다.
+포기한다. **DNS 리다이렉션과 `relay.py serve`가 먼저 떠 있는 상태에서**
+`provision.py reset`을 트리거해야 한다 — 순서가 바뀌면 기기가 재시도를 다
+소진해버리고, 다시 잡으려면 SoftAP 재프로비저닝부터 반복해야 한다.
 
 ### 사용법
 
@@ -132,6 +140,10 @@ python3 relay.py serve -p 443 -p 8883 --default-domain <대상 도메인> --dns 
 
 # 로컬에선 비표준 포트로 받고 업스트림은 표준 포트로 (LOCAL:REMOTE)
 python3 relay.py serve -p 18883:8883 --default-domain <대상 도메인> --dns 8.8.8.8
+
+# 포트마다 다른 기본 도메인을 직접 붙이기(LOCAL:REMOTE:DOMAIN) — 이 포트에 한해
+# --default-domain보다 우선. 여러 서비스가 포트별로 다른 도메인을 쓸 때 유용.
+python3 relay.py serve -p 443:443:<도메인A> -p 18831:18831:<도메인B> --dns 8.8.8.8
 
 python3 relay.py gen-ca --force      # 루트 CA만 미리 만들어두거나 강제 재생성(선택 — 자동 생성됨)
 ```
@@ -149,11 +161,44 @@ SNI로 도메인을 구분해서 도메인별로 인증서를 따로 발급하�
 
 `--dns`를 지정하면 실제 서버의 응답이 그대로 기기에 전달된다. 그 응답에
 펌웨어/OTA 지시가 섞여 있으면 그대로 전달된다는 뜻이다 — 화면 로그를 보면서
-수상한 응답이 보이면 즉시 프로세스를 죽일 것.
+수상한 응답이 보이면 즉시 프로세스를 죽일 것(자동 차단은 없음). Decloud는
+우리가 rules로 직접 응답을 만드니 이 위험 자체가 없다.
+
+## 3. 로컬 전용(Decloud) + observer 로컬 주입
+
+`--dns`를 안 주면(또는 조회/연결 실패시) `relay.py`는 업스트림 없이 그 자리에서
+HTTP(`:80`/`:443`)와 MQTT(`:18831`)를 직접 서빙한다 — 실 클라우드 서버 없이도
+기기가 정상 동작(CSE 부트스트랩 통과, 상태 리포트 수신)한다:
+
+```bash
+sudo python3 relay.py serve -p 443:443:<대상 도메인> -p 18831:18831:<대상 도메인> \
+  --http-port 80 --rules-dir rules --observer 127.0.0.1:9883
+```
+
+`rules/*.py`(파일명 알파벳순, 핫리로드 — 계약은 `rules_engine.py` docstring)가
+실제 응답을 만든다. **엔진(`relay.py`)엔 기기별 하드코딩이 0줄** — 기기 특유의
+값(CSE 부트스트랩 golden 응답, `:443 POST /mef` 인증 응답, `device_control` 포맷)은
+전부 `rules/99-default.py`에 있다. 다른 기기/버전을 다루고 싶으면 이 파일보다
+먼저 정렬되는 이름(예: `10-other-device.py`)으로 새 규칙 파일을 추가할 것 —
+파일명 순서대로 먼저 매칭되는 게 이긴다(nginx conf.d 관례).
+
+**observer**(`--observer HOST:PORT`)는 평문 MQTT 리스너를 하나 더 연다(로컬신뢰망
+전용, 방화벽으로 반드시 보호할 것). 여기로 JSON 커맨드를 PUBLISH하면
+`rules/*.py`의 `on_local_inject()`가 실제 oneM2M `device_control` 메시지로 번역해서
+현재 붙어있는 기기 세션에 그대로 주입한다(Proxy든 Decloud든 무관하게 동작 —
+Proxy에서도 기기의 `CONNECT`를 살짝 엿봐서 주입 대상을 확보해둔다):
+
+```bash
+mosquitto_pub -h 127.0.0.1 -p 9883 -t mtap/cmd -m '{"outlet":1,"on":true}'
+```
+
+> ⚠️ **`device_control`(서버→기기 원격 제어) 명령은 아직 와이어 레벨로 실증되지
+> 않았다** — `rules/99-default.py`의 `on_local_inject()`에 있는 to/fr/topic 값은
+> 펌웨어 디스어셈블(§16)로 확정한 것과 req/resp 토픽 대칭성에서 추론한 것이다.
+> 처음 시도할 때는 반드시 사람이 지켜보면서 할 것.
 
 ## 안전 수칙
 
 - 본인 소유 기기에서만 사용할 것.
 - 프로비저닝 후 기기가 서드파티 클라우드에 자동 등록되면 펌웨어가 비가역적으로
-  교체될 수 있다. 재현 시 CCS/OTA 트래픽 차단 등 안전장치를 유지할 것
-  (자세한 내용은 [PROTOCOL.md](PROTOCOL.md) 하단).
+  교체될 수 있다. 재현 시 CCS/OTA 트래픽 차단 등 안전장치를 유지할 것.
