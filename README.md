@@ -164,6 +164,26 @@ SNI로 도메인을 구분해서 도메인별로 인증서를 따로 발급하�
 수상한 응답이 보이면 즉시 프로세스를 죽일 것(자동 차단은 없음). Decloud는
 우리가 rules로 직접 응답을 만드니 이 위험 자체가 없다.
 
+### 설정 파일(`smartrelay.toml`) — 앱/도커 배포용
+
+CLI 인자 대신 실행 시점의 working dir에 `smartrelay.toml`을 놓으면 `relay.py serve`가
+자동으로 읽는다(없어도 에러 아님 — 그냥 CLI/기본값으로 진행). 값 우선순위는
+**CLI 인자 > 설정 파일 > 코드 기본값**이라, 필요한 항목만 CLI로 덮어쓸 수 있다.
+포맷은 TOML — 이 리포가 표준 라이브러리만 쓴다는 원칙을 지키면서(Python 3.11+의
+`tomllib`, 추가 의존성 0) 포트 목록 같은 중첩 구조를 INI보다 깔끔하게 표현할 수 있어서
+골랐다(YAML은 PyYAML 외부 의존성이 필요해서 제외).
+
+```bash
+cp smartrelay.toml.example smartrelay.toml   # 값 채운 뒤
+python3 relay.py serve                        # 인자 없이 실행 — smartrelay.toml을 읽음
+# 다른 경로를 쓰고 싶으면:
+python3 relay.py serve --config /etc/smartrelay/smartrelay.toml
+```
+
+도커 배포시엔 이미지에 `smartrelay.toml`을 굽거나 볼륨/바인드마운트로 working dir에
+올려두면 된다(설정값 자체는 `.gitignore`에 포함되어 있어 커밋되지 않음 —
+`smartrelay.toml.example`만 리포에 남는다).
+
 ## 3. 로컬 전용(Decloud) + observer 로컬 주입
 
 `--dns`를 안 주면(또는 조회/연결 실패시) `relay.py`는 업스트림 없이 그 자리에서

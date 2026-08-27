@@ -74,6 +74,11 @@ import time
 from dataclasses import dataclass
 from typing import Optional
 
+try:
+    import tomllib  # 표준 라이브러리(Python 3.11+) — 설정 파일 파싱용, 추가 의존성 없음
+except ModuleNotFoundError:
+    sys.exit("Python 3.11 이상이 필요합니다(tomllib 표준 라이브러리 사용).")
+
 import mqtt_session
 import mqtt_wire as mw
 from rules_engine import HttpResponse, RulesHandle
@@ -82,6 +87,31 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 DEFAULT_CERT_DIR = os.path.join(SCRIPT_DIR, "certs")
 DEFAULT_RULES_DIR = os.path.join(SCRIPT_DIR, "rules")
+DEFAULT_CONFIG_NAME = "smartrelay.toml"
+
+
+# ---------------------------------------------------------------------------
+# 설정 파일 — 실행 시점의 working dir에서 읽는다(도커/앱 배포시 볼륨 마운트로
+# smartrelay.toml 하나만 갈아끼우면 되게). 값 우선순위: CLI 인자 > 설정 파일 > 기본값.
+# ---------------------------------------------------------------------------
+
+def load_config(path: Optional[str]) -> dict:
+    """--config로 명시하면 그 경로를 반드시 읽고, 안 주면 현재 working dir의
+    smartrelay.toml을 있으면 읽고 없으면 그냥 빈 설정으로 취급한다."""
+    explicit = path is not None
+    if path is None:
+        path = os.path.join(os.getcwd(), DEFAULT_CONFIG_NAME)
+    if not os.path.exists(path):
+        if explicit:
+            sys.exit(f"설정 파일을 찾을 수 없음: {path}")
+        return {}
+    with open(path, "rb") as f:
+        try:
+            data = tomllib.load(f)
+        except tomllib.TOMLDecodeError as e:
+            sys.exit(f"설정 파일 파싱 실패({path}): {e}")
+    print(f"[config] {path} 로드함")
+    return data
 
 _leaf_lock = threading.Lock()
 
@@ -833,48 +863,71 @@ def parse_ports(specs) -> dict:
     return ports
 
 
+def _config_port_specs(cfg_ports) -> list:
+    """설정 파일의 [[relay.port]] 배열을 parse_ports()가 받는 'LOCAL:REMOTE:DOMAIN' 문자열로 변환."""
+    specs = []
+    for entry in cfg_ports:
+        local = entry["local"]
+        remote = entry.get("remote", local)
+        domain = entry.get("domain")
+        specs.append(f"{local}:{remote}:{domain}" if domain else f"{local}:{remote}")
+    return specs
+
+
 def cmd_serve(args):
-    ports = parse_ports(args.port)
+    cfg = load_config(args.config).get("relay", {})
+
+    listen_host = args.listen_host if args.listen_host is not None else cfg.get("listen_host", "0.0.0.0")
+    http_port = args.http_port if args.http_port is not None else cfg.get("http_port", 80)
+    cert_dir = args.cert_dir if args.cert_dir is not None else cfg.get("cert_dir", DEFAULT_CERT_DIR)
+    rules_dir = args.rules_dir if args.rules_dir is not None else cfg.get("rules_dir", DEFAULT_RULES_DIR)
+    dns = args.dns if args.dns is not None else cfg.get("dns")
+    default_domain = args.default_domain if args.default_domain is not None else cfg.get("default_domain")
+    observer = args.observer if args.observer is not None else cfg.get("observer")
+    log_dir = args.log_dir if args.log_dir is not None else cfg.get("log_dir")
+
+    port_specs = args.port if args.port else (_config_port_specs(cfg["port"]) if cfg.get("port") else None)
+    ports = parse_ports(port_specs)
 
     # bind는 여기(메인 스레드)에서 미리 해서, 실패하면 스레드 없이 바로 죽는다.
-    http_ls = bind_listener(args.listen_host, args.http_port)
-    tls_listeners = {local: bind_listener(args.listen_host, local) for local in ports}
+    http_ls = bind_listener(listen_host, http_port)
+    tls_listeners = {local: bind_listener(listen_host, local) for local in ports}
     observer_ls = None
-    if args.observer:
-        ohost, oport = args.observer.rsplit(":", 1)
+    if observer:
+        ohost, oport = observer.rsplit(":", 1)
         observer_ls = bind_listener(ohost or "0.0.0.0", int(oport))
 
-    ca_crt, _ = ensure_ca(args.cert_dir)
+    ca_crt, _ = ensure_ca(cert_dir)
     with open(ca_crt, "rb") as f:
         ca_pem = f.read()
 
-    rules = RulesHandle(args.rules_dir) if args.rules_dir else RulesHandle.empty()
+    rules = RulesHandle(rules_dir) if rules_dir else RulesHandle.empty()
 
     print("=" * 70)
     print("DNS 리다이렉션 확인: 대상 도메인 조회가 이 머신으로 오고 있어야 동작합니다.")
     print("  (예: dnsmasq) address=/<대상 도메인>/<이 머신의 LAN IP>")
-    port_summary = {local: (cfg["remote"], cfg["domain"]) for local, cfg in ports.items()}
-    print(f"리슨: :{args.http_port}(CA 응답) / TLS {port_summary} (local: (remote, 포트별기본도메인))")
-    if args.default_domain:
-        print(f"SNI 없는 연결의 기본 도메인: {args.default_domain}")
-    if args.dns:
-        print(f"업스트림: --dns {args.dns} 로 실제 IP를 조회해서 릴레이(Proxy) — 실패시 Decloud 폴백")
-        print(f"  (주의: {args.dns}가 기기용 DNS 리다이렉션과 같은 서버면 안 됨)")
+    port_summary = {local: (cfg2["remote"], cfg2["domain"]) for local, cfg2 in ports.items()}
+    print(f"리슨: :{http_port}(CA 응답) / TLS {port_summary} (local: (remote, 포트별기본도메인))")
+    if default_domain:
+        print(f"SNI 없는 연결의 기본 도메인: {default_domain}")
+    if dns:
+        print(f"업스트림: --dns {dns} 로 실제 IP를 조회해서 릴레이(Proxy) — 실패시 Decloud 폴백")
+        print(f"  (주의: {dns}가 기기용 DNS 리다이렉션과 같은 서버면 안 됨)")
     else:
         print("업스트림: 없음(--dns 미지정) — 전부 Decloud(rules가 직접 응답)")
-    print(f"rules 디렉터리: {args.rules_dir or '(비활성화)'}")
+    print(f"rules 디렉터리: {rules_dir or '(비활성화)'}")
     if observer_ls:
         print(f"observer: {observer_ls.getsockname()}")
-    print(f"파일 캡처: {args.log_dir if args.log_dir else '꺼짐(--log-dir로 지정하면 켜짐)'}")
+    print(f"파일 캡처: {log_dir if log_dir else '꺼짐(--log-dir로 지정하면 켜짐)'}")
     print("=" * 70)
     sys.stdout.flush()
 
     threads = [threading.Thread(target=listen80, args=(http_ls, ca_pem), daemon=True)]
-    for local, cfg in ports.items():
+    for local, cfg2 in ports.items():
         threads.append(threading.Thread(
             target=listen_tls,
-            args=(tls_listeners[local], local, cfg["remote"], args.cert_dir, args.dns,
-                  cfg["domain"], args.default_domain, args.log_dir, rules),
+            args=(tls_listeners[local], local, cfg2["remote"], cert_dir, dns,
+                  cfg2["domain"], default_domain, log_dir, rules),
             daemon=True,
         ))
     if observer_ls:
@@ -896,16 +949,24 @@ def main():
     p_gen.set_defaults(func=cmd_gen_ca)
 
     p_serve = sub.add_parser("serve", help="릴레이 서버 실행")
-    p_serve.add_argument("--cert-dir", default=DEFAULT_CERT_DIR,
-                          help="CA/리프 저장 위치(없으면 자동 생성, 있으면 재사용)")
-    p_serve.add_argument("--listen-host", default="0.0.0.0")
-    p_serve.add_argument("--http-port", type=int, default=80, help="CA를 즉시 응답할 평문 포트(기본 80)")
+    p_serve.add_argument(
+        "--config", default=None,
+        help=f"설정 파일 경로(TOML). 안 주면 현재 working dir의 {DEFAULT_CONFIG_NAME}을 있으면 "
+             "자동으로 읽는다(없어도 에러 아님 — CLI 인자/기본값으로 진행). "
+             "값 우선순위: CLI 인자 > 설정 파일 > 기본값.",
+    )
+    p_serve.add_argument("--cert-dir", default=None,
+                          help=f"CA/리프 저장 위치(없으면 자동 생성, 있으면 재사용). 기본: {DEFAULT_CERT_DIR}")
+    p_serve.add_argument("--listen-host", default=None, help="기본: 0.0.0.0")
+    p_serve.add_argument("--http-port", type=int, default=None,
+                          help="CA를 즉시 응답할 평문 포트(기본 80)")
     p_serve.add_argument(
         "-p", "--port", action="append", default=None,
         help="TLS로 종단할 로컬 포트. 반복 또는 콤마로 여러 개. "
              "'PORT'(로컬=업스트림 같은 포트), 'LOCAL:REMOTE'(예: 18883:8883), 또는 "
              "'LOCAL:REMOTE:DOMAIN'(그 포트에서 SNI 없을 때 쓸 기본 도메인 지정, "
-             "--default-domain보다 우선). 예: -p 443 -p 18831:18831:example.com",
+             "--default-domain보다 우선). 예: -p 443 -p 18831:18831:example.com. "
+             "안 주면 설정 파일의 [[relay.port]]를 대신 사용.",
     )
     p_serve.add_argument(
         "--dns", default=None,
@@ -917,8 +978,9 @@ def main():
         help="ClientHello에 SNI가 없는 기기를 위한 전역 기본 도메인(인증서 발급 + --dns 조회에 "
              "그대로 씀). -p로 그 포트의 도메인을 따로 지정하지 않은 경우의 fallback.",
     )
-    p_serve.add_argument("--rules-dir", default=DEFAULT_RULES_DIR,
-                          help="rules/*.py 디렉터리(빈 문자열로 주면 비활성화 — 순수 관찰/릴레이만)")
+    p_serve.add_argument("--rules-dir", default=None,
+                          help="rules/*.py 디렉터리(빈 문자열로 주면 비활성화 — 순수 관찰/릴레이만). "
+                               f"기본: {DEFAULT_RULES_DIR}")
     p_serve.add_argument("--observer", default=None,
                           help="평문 MQTT 로컬주입 리스너 HOST:PORT (예: 127.0.0.1:9883)")
     p_serve.add_argument("--log-dir", default=None,
