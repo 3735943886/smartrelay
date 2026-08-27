@@ -6,3 +6,4 @@ certs/
 captures/
 rules/
 smartrelay.toml
+*.key
