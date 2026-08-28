@@ -324,6 +324,7 @@ def _decode_configuration(raw):
 
 def _parse_telemetry_params(params: list) -> dict:
     power, meter_watts, energy_raw, configuration, alarms, standby_state = {}, {}, {}, {}, {}, {}
+    wifi = {}
     malformed_switches = []
     status_report_seen: set[int] = set()
 
@@ -331,6 +332,15 @@ def _parse_telemetry_params(params: list) -> dict:
         if not isinstance(p, dict):
             continue
         cmd = str(p.get("command", ""))
+
+        # SSID/RSSI는 특정 command 전용이 아니라 거의 모든 파라미터에 같이 실려온다.
+        if "SSID" in p:
+            wifi["ssid"] = p["SSID"]
+        if "RSSI" in p:
+            try:
+                wifi["rssi_dbm"] = int(str(p["RSSI"]))
+            except ValueError:
+                wifi["rssi_raw"] = p["RSSI"]
 
         m = _POWER_RE.match(cmd)
         if m:
@@ -410,6 +420,7 @@ def _parse_telemetry_params(params: list) -> dict:
     return {
         "power": power, "meter_watts": meter_watts, "energy_raw": energy_raw,
         "configuration": configuration, "alarms": alarms, "standby_state": standby_state,
+        "wifi": wifi,
         "status_report_selectors": sorted(status_report_seen),
         "malformed_switches": malformed_switches,
     }
@@ -451,7 +462,7 @@ def _handle_telemetry(ctx, pc: dict, rqi: str = ""):
         return
 
     parsed = _parse_telemetry_params(params)
-    merge_keys = ("power", "meter_watts", "energy_raw", "configuration", "alarms", "standby_state")
+    merge_keys = ("power", "meter_watts", "energy_raw", "configuration", "alarms", "standby_state", "wifi")
 
     if ctx.client_id:
         st = _device_state(ctx.client_id)
@@ -461,7 +472,12 @@ def _handle_telemetry(ctx, pc: dict, rqi: str = ""):
             if not new_values:
                 continue
             bucket = st.setdefault(key, {})
-            diff = {k: v for k, v in new_values.items() if bucket.get(k) != v}
+            if key == "wifi":
+                # RSSI는 이벤트마다 몇 dBm씩 흔들리는 노이즈라 그대로 diff에 넣으면 다시
+                # 스팸이 된다 — SSID(접속 AP)가 실제로 바뀔 때만 의미 있는 변화로 본다.
+                diff = {k: v for k, v in new_values.items() if k == "ssid" and bucket.get(k) != v}
+            else:
+                diff = {k: v for k, v in new_values.items() if bucket.get(k) != v}
             if diff:
                 changed[key] = diff
             bucket.update(new_values)
