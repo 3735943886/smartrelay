@@ -28,12 +28,35 @@ rules/ 디렉터리 안의 *.py 전부를 파일명 알파벳순으로 로드(�
 from __future__ import annotations
 
 import importlib.util
+import logging
 import os
-import sys
 import threading
-import traceback
 from dataclasses import dataclass
 from typing import Optional
+
+# TRACE < DEBUG — 매 이벤트/매 패킷 단위로 무조건 찍히는 가장 시끄러운 레벨.
+# 기본(INFO)에서는 안 보이고 --log-level trace로 켰을 때만 나온다.
+TRACE = 5
+logging.addLevelName(TRACE, "TRACE")
+
+
+def _trace(self, message, *args, **kwargs):
+    if self.isEnabledFor(TRACE):
+        self._log(TRACE, message, args, **kwargs)
+
+
+logging.Logger.trace = _trace
+
+LOG_LEVELS = {
+    "TRACE": TRACE,
+    "DEBUG": logging.DEBUG,
+    "INFO": logging.INFO,
+    "WARNING": logging.WARNING,
+    "ERROR": logging.ERROR,
+    "CRITICAL": logging.CRITICAL,
+}
+
+_log = logging.getLogger("rules_engine")
 
 
 @dataclass
@@ -92,10 +115,9 @@ class RulesHandle:
                     mod = importlib.util.module_from_spec(spec)
                     spec.loader.exec_module(mod)
                     self._modules[path] = _Module(path=path, mtime=mtime, mod=mod)
-                    print(f"[rules] 로드: {fname}")
+                    _log.info("로드: %s", fname)
                 except Exception:
-                    print(f"[rules] {fname} 로드 실패(스킵):", file=sys.stderr)
-                    traceback.print_exc()
+                    _log.exception("%s 로드 실패(스킵)", fname)
             for path in list(self._modules):
                 if path not in seen:
                     del self._modules[path]
@@ -113,8 +135,7 @@ class RulesHandle:
             try:
                 result = fn(*args)
             except Exception:
-                print(f"[rules] {hook_name} 실행 중 예외(스킵):", file=sys.stderr)
-                traceback.print_exc()
+                _log.exception("%s 실행 중 예외(스킵)", hook_name)
                 continue
             if result is not None:
                 return result
@@ -129,8 +150,7 @@ class RulesHandle:
             try:
                 result = fn(*args)
             except Exception:
-                print(f"[rules] {hook_name} 실행 중 예외(스킵):", file=sys.stderr)
-                traceback.print_exc()
+                _log.exception("%s 실행 중 예외(스킵)", hook_name)
                 continue
             if result:
                 out.extend(result)
@@ -162,8 +182,7 @@ class RulesHandle:
                 result = fn(ctx, now_ms)
                 mod._last_tick_ms = now_ms
             except Exception:
-                print("[rules] on_tick 실행 중 예외(스킵):", file=sys.stderr)
-                traceback.print_exc()
+                _log.exception("on_tick 실행 중 예외(스킵)")
                 continue
             if result:
                 out.extend(result)

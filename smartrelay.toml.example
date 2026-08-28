@@ -10,6 +10,9 @@ http_port = 80
 cert_dir = "certs"
 rules_dir = "rules"
 
+# 콘솔 로그 레벨: trace/debug/info/warning/error/critical (기본 info).
+# log_level = "info"
+
 # --dns 서버(예: 8.8.8.8). 안 주면(또는 주석 처리하면) Decloud로 동작(rules가 직접 응답).
 # dns = "8.8.8.8"
 
@@ -21,7 +24,7 @@ rules_dir = "rules"
 # observer = "127.0.0.1:9883"
 
 # 지정하면 연결별 바이트 캡처 파일을 남긴다(기본은 꺼짐).
-# log_dir = "captures"
+# capture_dir = "captures"
 
 # TLS로 종단할 로컬 포트 목록. remote/domain은 생략 가능(remote 생략시 local과 동일).
 [[relay.port]]

@@ -12,12 +12,15 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import logging
 import random
 import re
 import threading
 import time
 
 from rules_engine import HttpResponse, PublishSpec
+
+_log = logging.getLogger(__name__)
 
 # --- 이 기기 실측값 (ANALYSIS.md / captures 기준) ---
 VENDOR_CODE = "0000564"
@@ -221,7 +224,7 @@ def on_message(ctx, msg, topic):
                 response_pc[key] = value
         return [_envelope_to_pub(ctx, _reply_envelope(msg, response_pc))]
 
-    print(f"[rules/99-default] 미인식 rqi={rqi!r} op={msg.get('op')!r} (PUBACK만 보내고 응답 없음)")
+    _log.warning("미인식 rqi=%r op=%r (PUBACK만 보내고 응답 없음)", rqi, msg.get("op"))
     return None
 
 
@@ -431,8 +434,10 @@ def _handle_telemetry(ctx, pc: dict, rqi: str = ""):
             _device_state(ctx.client_id)["last_cmd_report"] = {
                 "rqi": rqi, "result": result, "rpt_id": report.get("rpt_id"),
             }
-        ok = "성공" if result == 0 else f"실패/미확인(result={result})"
-        print(f"[rules/99-default] device_control 응답 {cid_str}: rqi={rqi} {ok}")
+        if result == 0:
+            _log.info("device_control 응답 %s: rqi=%s 성공", cid_str, rqi)
+        else:
+            _log.warning("device_control 응답 %s: rqi=%s 실패/미확인(result=%r)", cid_str, rqi, result)
 
     if notif is not None:
         params = notif.get("parameters")
@@ -446,11 +451,23 @@ def _handle_telemetry(ctx, pc: dict, rqi: str = ""):
         return
 
     parsed = _parse_telemetry_params(params)
+    merge_keys = ("power", "meter_watts", "energy_raw", "configuration", "alarms", "standby_state")
 
     if ctx.client_id:
         st = _device_state(ctx.client_id)
-        for key in ("power", "meter_watts", "energy_raw", "configuration", "alarms", "standby_state"):
-            st.setdefault(key, {}).update(parsed.get(key) or {})
+        changed = {}
+        for key in merge_keys:
+            new_values = parsed.get(key) or {}
+            if not new_values:
+                continue
+            bucket = st.setdefault(key, {})
+            diff = {k: v for k, v in new_values.items() if bucket.get(k) != v}
+            if diff:
+                changed[key] = diff
+            bucket.update(new_values)
+        if changed:
+            _log.info("텔레메트리 변경 %s: %s", cid_str, changed)
+
         # STATUS_REPORT는 셀렉터당 별도 메시지로 오므로, 이번 접속에서 지금까지 본
         # 셀렉터 집합에 계속 합집합해서 5개가 다 모였는지를 세션 단위로 판단한다.
         # 이 집합은 smartplugbootstrap(재접속마다 다시 옴)에서 새로 초기화된다.
@@ -460,12 +477,13 @@ def _handle_telemetry(ctx, pc: dict, rqi: str = ""):
         st["status_missing_selectors"] = sorted(_STATUS_REQUIRED_SELECTORS - seen)
 
     if parsed["malformed_switches"]:
-        print(f"[rules/99-default] 이상값 감지 {cid_str}: {parsed['malformed_switches']}")
+        _log.warning("이상값 감지 %s: %s", cid_str, parsed["malformed_switches"])
 
-    summary_keys = ("power", "meter_watts", "energy_raw", "configuration", "alarms", "standby_state")
-    summary = ", ".join(f"{k}={parsed[k]}" for k in summary_keys if parsed.get(k))
-    if summary:
-        print(f"[rules/99-default] 텔레메트리 {cid_str}: {summary}")
+    # 값이 바뀌었든 아니든 매번 원본 파싱 결과 전체를 보고 싶을 때만(--log-level trace) 나옴 —
+    # 기본(info)에서는 위의 "텔레메트리 변경"처럼 실제로 바뀐 것만 보인다.
+    raw_summary = ", ".join(f"{k}={parsed[k]}" for k in merge_keys if parsed.get(k))
+    if raw_summary:
+        _log.trace("텔레메트리 원본 %s: %s", cid_str, raw_summary)
 
 
 # --------------------------------------------------------------------------
@@ -475,8 +493,10 @@ def _handle_telemetry(ctx, pc: dict, rqi: str = ""):
 # "LIVE-WIRE"(실기기 Voltra Cloud->device 트래픽 캡처 기반) 구현을 참고해서 맞춘 것이다.
 # 예전 버전(순수 추론)과 달라진 점: cmd_id가 명령 문자열이 아니라 정수(1=제어,2=상태조회),
 # inner에 header/notification 블록 필요, parameter의 command에 _SET 접미사 필요,
-# 봉투 fr이 IN_CSE-BASE-1이 아니라 미들노드(MN_CSE_ID). 이 저장소 자체 와이어로는
-# 아직 재검증 안 됐으니 처음 실기기로 시험할 때는 반드시 사람이 지켜볼 것.
+# 봉투 fr이 IN_CSE-BASE-1이 아니라 미들노드(MN_CSE_ID). POWER 제어(on/off)는 실기기
+# 캡처로 성공 확인됨(2026-08-28, result:0 + 후속 POWERn_EVENT 물리 확인까지 일치) —
+# status/configuration은 아직 이 저장소 자체 와이어로 검증 안 됐으니 처음 시험할 때는
+# 반드시 사람이 지켜볼 것.
 # --------------------------------------------------------------------------
 
 def _control_header(ctx, session_id: str) -> dict:
@@ -484,11 +504,14 @@ def _control_header(ctx, session_id: str) -> dict:
     device_id = st.get("device_id")
     if not device_id:
         # 이 세션의 smartplugbootstrap을 못 봤다(예: relay 재시작 사이 재접속) — 실제 MAC
-        # 기반 device_id를 모르니 entity 중간 세그먼트로 대체하고 경고를 남긴다.
+        # 기반 device_id를 모르니 entity 중간 세그먼트로 대체한다. 경고는 세션당 한 번만
+        # (명령 낼 때마다 반복하면 로그만 시끄럽고 정보량은 없음).
         cid = (ctx.device_client_id or b"").decode(errors="replace")
         parts = cid.split("-")
         device_id = (parts[2] if len(parts) >= 4 else cid).upper()
-        print(f"[rules/99-default] device_id 미확보(부트스트랩 미관측) — {device_id} 로 추정해서 진행")
+        if not st.get("_device_id_fallback_warned"):
+            _log.warning("device_id 미확보(부트스트랩 미관측, client=%s) — %s 로 추정해서 진행", cid, device_id)
+            st["_device_id_fallback_warned"] = True
     return {
         "version": "v2", "vendor_code": VENDOR_CODE, "api_key": "device_control",
         "session_id": session_id, "device_id": device_id, "device_uuid": device_id,
@@ -541,7 +564,7 @@ def on_local_inject(ctx, cmd):
        "threshold_centiwatt": 500, "enabled": true}       # 대기전력 컷오프 임계값 설정(1~4번만)
     """
     if not ctx.device_client_id:
-        print("[rules/99-default] 주입 대상 기기 세션 없음 — 무시")
+        _log.warning("주입 대상 기기 세션 없음 — 무시")
         return None
 
     action = cmd.get("action", "power")
@@ -553,11 +576,11 @@ def on_local_inject(ctx, cmd):
     elif action == "configuration":
         outlet = int(cmd.get("outlet", 1))
         if outlet not in range(1, 5):
-            print(f"[rules/99-default] configuration outlet은 1~4만 지원(받음: {outlet}) — 무시")
+            _log.warning("configuration outlet은 1~4만 지원(받음: %d) — 무시", outlet)
             return None
         threshold = int(cmd.get("threshold_centiwatt", 0))
         if not 0 <= threshold <= 0xFFFFFF:
-            print(f"[rules/99-default] threshold_centiwatt은 0~{0xFFFFFF} 범위(받음: {threshold}) — 무시")
+            _log.warning("threshold_centiwatt은 0~%d 범위(받음: %d) — 무시", 0xFFFFFF, threshold)
             return None
         enabled = bool(cmd.get("enabled", False))
         raw = f"{threshold:06X}{1 if enabled else 0:02X}"
@@ -567,7 +590,7 @@ def on_local_inject(ctx, cmd):
     elif action == "power":
         outlet = int(cmd.get("outlet", 1))
         if outlet not in range(0, 5):
-            print(f"[rules/99-default] power outlet은 0(전체)~4만 지원(받음: {outlet}) — 무시")
+            _log.warning("power outlet은 0(전체)~4만 지원(받음: %d) — 무시", outlet)
             return None
         on = bool(cmd.get("on", False))
         suffix = "" if outlet == 0 else str(outlet)
@@ -575,7 +598,7 @@ def on_local_inject(ctx, cmd):
         parameters = [{"command": f"POWER{suffix}_SET", f"switchBinary{suffix}": "FF" if on else "00"}]
 
     else:
-        print(f"[rules/99-default] 알 수 없는 action={action!r} — 무시")
+        _log.warning("알 수 없는 action=%r — 무시", action)
         return None
 
     envelope = _build_control_envelope(ctx, client_id, cmd_id, parameters)

@@ -47,11 +47,12 @@ Proxy 모드(--dns 지정)에서는 실서버 응답이 그대로 기기에 전�
   1) 관찰 — 접속해있는 동안 기기 세션(:18831, Proxy든 Decloud든)에 오가는 모든 MQTT
      PUBLISH를 그대로 tap받는다(파일 캡처 없이 실시간으로 보는 용도).
   2) 주입 — PUBLISH한 JSON 커맨드(예: {"outlet":1,"on":true})가 rules/*.py의
-     on_local_inject()로 번역되어 실제 기기 세션에 그대로 들어간다. 아직 실증 안 된
-     device_control 첫 시도가 여기서 나가므로 반드시 관찰하면서 시험할 것.
+     on_local_inject()로 번역되어 실제 기기 세션에 그대로 들어간다. POWER 제어(on/off)는
+     실기기 캡처로 성공 확인됨(2026-08-28) — 다른 action(status/configuration)은 아직
+     이 저장소 자체 와이어로 검증 안 됐으니 처음 시험할 땐 반드시 관찰할 것.
 
 *** 파일 캡처는 기본 꺼짐 ***
---log-dir 을 명시적으로 줄 때만 device_to_upstream.bin/upstream_to_device.bin 로 저장한다.
+--capture-dir 을 명시적으로 줄 때만 device_to_upstream.bin/upstream_to_device.bin 로 저장한다.
 평소엔 위 observer로 필요할 때만 들여다볼 것 — 디스크에 아무것도 안 남기는 게 기본값이다.
 
 사용:
@@ -61,6 +62,7 @@ Proxy 모드(--dns 지정)에서는 실서버 응답이 그대로 기기에 전�
 
 import argparse
 import json
+import logging
 import os
 import random
 import socket
@@ -81,7 +83,7 @@ except ModuleNotFoundError:
 
 import mqtt_session
 import mqtt_wire as mw
-from rules_engine import HttpResponse, PublishSpec, RulesHandle
+from rules_engine import LOG_LEVELS, HttpResponse, PublishSpec, RulesHandle
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -358,7 +360,7 @@ DEVICE_REGISTRY = DeviceRegistry()
 
 # ---------------------------------------------------------------------------
 # tap 버스 — observer에 접속해있는 동안 기기 세션의 실제 MQTT PUBLISH를 그대로
-# 실시간으로 흘려보낸다(파일 캡처 없이 관찰하는 용도, --log-dir과 무관하게 항상 동작).
+# 실시간으로 흘려보낸다(파일 캡처 없이 관찰하는 용도, --capture-dir과 무관하게 항상 동작).
 # ---------------------------------------------------------------------------
 
 class TapBus:
@@ -650,7 +652,7 @@ def serve_mqtt_locally(dev_tls, cid, ctx, rules: RulesHandle, first: bytes, fp_d
 
 
 def handle_tls(raw_client, addr, local_port, remote_port, cert_dir, dns_server, port_domain,
-               default_domain, log_dir, rules: RulesHandle):
+               default_domain, capture_dir, rules: RulesHandle):
     cid = f":{local_port}-{addr[0]}:{addr[1]}-{int(time.time())}"
     log(cid, f"{addr[0]}에서 :{local_port} 연결(TLS)")
 
@@ -707,14 +709,14 @@ def handle_tls(raw_client, addr, local_port, remote_port, cert_dir, dns_server, 
         log(cid, "--dns 없음 — Decloud(rules 직접 서빙)")
 
     fp_dev = fp_up = None
-    if log_dir:
-        os.makedirs(log_dir, exist_ok=True)
-        fp_dev = open(os.path.join(log_dir, f"{cid}_device_to_upstream.bin"), "wb")
+    if capture_dir:
+        os.makedirs(capture_dir, exist_ok=True)
+        fp_dev = open(os.path.join(capture_dir, f"{cid}_device_to_upstream.bin"), "wb")
 
     if up_tls is not None:
         # --- Proxy: 기존 순수 relay, 양방향을 tee해서 registry 등록 + TAP으로 흘림 ---
-        if log_dir:
-            fp_up = open(os.path.join(log_dir, f"{cid}_upstream_to_device.bin"), "wb")
+        if capture_dir:
+            fp_up = open(os.path.join(capture_dir, f"{cid}_upstream_to_device.bin"), "wb")
         write_lock = threading.Lock()
         tee_down = _ProxyTap(dev_tls, write_lock)  # device->upstream (CONNECT 등록도 여기서)
         tee_up = _ProxyTap(dev_tls, write_lock)    # upstream->device (등록 없이 tap만)
@@ -764,7 +766,7 @@ def handle_tls(raw_client, addr, local_port, remote_port, cert_dir, dns_server, 
 
 
 def listen_tls(ls: socket.socket, local_port, remote_port, cert_dir, dns_server, port_domain,
-               default_domain, log_dir, rules: RulesHandle):
+               default_domain, capture_dir, rules: RulesHandle):
     domain_note = f", SNI 없을 때 기본 도메인={port_domain}" if port_domain else ""
     print(f"listening {ls.getsockname()[0]}:{local_port} — device TLS 종단"
           f"{'' if local_port == remote_port else f' (업스트림 포트는 :{remote_port})'}{domain_note}")
@@ -774,7 +776,7 @@ def listen_tls(ls: socket.socket, local_port, remote_port, cert_dir, dns_server,
         threading.Thread(
             target=handle_tls,
             args=(c, a, local_port, remote_port, cert_dir, dns_server, port_domain,
-                  default_domain, log_dir, rules),
+                  default_domain, capture_dir, rules),
             daemon=True,
         ).start()
 
@@ -893,6 +895,15 @@ def _config_port_specs(cfg_ports) -> list:
 def cmd_serve(args):
     cfg = load_config(args.config).get("relay", {})
 
+    log_level_name = str(args.log_level or cfg.get("log_level") or "INFO").upper()
+    if log_level_name not in LOG_LEVELS:
+        sys.exit(f"--log-level 값 오류: {log_level_name!r} (가능한 값: {', '.join(l.lower() for l in LOG_LEVELS)})")
+    logging.basicConfig(
+        level=LOG_LEVELS[log_level_name],
+        format="[%(asctime)s] [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
     listen_host = args.listen_host if args.listen_host is not None else cfg.get("listen_host", "0.0.0.0")
     http_port = args.http_port if args.http_port is not None else cfg.get("http_port", 80)
     cert_dir = args.cert_dir if args.cert_dir is not None else cfg.get("cert_dir", DEFAULT_CERT_DIR)
@@ -900,7 +911,7 @@ def cmd_serve(args):
     dns = args.dns if args.dns is not None else cfg.get("dns")
     default_domain = args.default_domain if args.default_domain is not None else cfg.get("default_domain")
     observer = args.observer if args.observer is not None else cfg.get("observer")
-    log_dir = args.log_dir if args.log_dir is not None else cfg.get("log_dir")
+    capture_dir = args.capture_dir if args.capture_dir is not None else cfg.get("capture_dir")
 
     port_specs = args.port if args.port else (_config_port_specs(cfg["port"]) if cfg.get("port") else None)
     ports = parse_ports(port_specs)
@@ -934,7 +945,8 @@ def cmd_serve(args):
     print(f"rules 디렉터리: {rules_dir or '(비활성화)'}")
     if observer_ls:
         print(f"observer: {observer_ls.getsockname()}")
-    print(f"파일 캡처: {log_dir if log_dir else '꺼짐(--log-dir로 지정하면 켜짐)'}")
+    print(f"파일 캡처: {capture_dir if capture_dir else '꺼짐(--capture-dir로 지정하면 켜짐)'}")
+    print(f"로그 레벨: {log_level_name.lower()}")
     print("=" * 70)
     sys.stdout.flush()
 
@@ -943,7 +955,7 @@ def cmd_serve(args):
         threads.append(threading.Thread(
             target=listen_tls,
             args=(tls_listeners[local], local, cfg2["remote"], cert_dir, dns,
-                  cfg2["domain"], default_domain, log_dir, rules),
+                  cfg2["domain"], default_domain, capture_dir, rules),
             daemon=True,
         ))
     if observer_ls:
@@ -970,6 +982,11 @@ def main():
         help=f"설정 파일 경로(TOML). 안 주면 현재 working dir의 {DEFAULT_CONFIG_NAME}을 있으면 "
              "자동으로 읽는다(없어도 에러 아님 — CLI 인자/기본값으로 진행). "
              "값 우선순위: CLI 인자 > 설정 파일 > 기본값.",
+    )
+    p_serve.add_argument(
+        "--log-level", default=None,
+        help=f"콘솔 로그 레벨: {', '.join(l.lower() for l in LOG_LEVELS)} (기본 info). "
+             "trace는 매 텔레메트리 이벤트를 무조건 찍는 가장 시끄러운 레벨.",
     )
     p_serve.add_argument("--cert-dir", default=None,
                           help=f"CA/리프 저장 위치(없으면 자동 생성, 있으면 재사용). 기본: {DEFAULT_CERT_DIR}")
@@ -999,7 +1016,7 @@ def main():
                                f"기본: {DEFAULT_RULES_DIR}")
     p_serve.add_argument("--observer", default=None,
                           help="평문 MQTT 로컬주입 리스너 HOST:PORT (예: 127.0.0.1:9883)")
-    p_serve.add_argument("--log-dir", default=None,
+    p_serve.add_argument("--capture-dir", default=None,
                           help="지정하면 연결별로 device_to_upstream.bin/upstream_to_device.bin "
                                "파일 캡처를 남긴다(기본은 꺼짐 — 필요할 땐 --observer로 실시간 관찰).")
     p_serve.set_defaults(func=cmd_serve)
