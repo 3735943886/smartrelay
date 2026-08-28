@@ -30,6 +30,7 @@ from __future__ import annotations
 import importlib.util
 import os
 import sys
+import threading
 import traceback
 from dataclasses import dataclass
 from typing import Optional
@@ -62,6 +63,7 @@ class RulesHandle:
     def __init__(self, rules_dir: Optional[str]):
         self.rules_dir = rules_dir
         self._modules: dict[str, _Module] = {}
+        self._lock = threading.Lock()
         if rules_dir:
             self._reload()
 
@@ -74,32 +76,34 @@ class RulesHandle:
             return
         files = sorted(f for f in os.listdir(self.rules_dir) if f.endswith(".py"))
         seen = set()
-        for fname in files:
-            path = os.path.join(self.rules_dir, fname)
-            seen.add(path)
-            try:
-                mtime = os.path.getmtime(path)
-            except OSError:
-                continue
-            existing = self._modules.get(path)
-            if existing and existing.mtime == mtime:
-                continue
-            try:
-                spec = importlib.util.spec_from_file_location(f"rules_{fname[:-3]}", path)
-                mod = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(mod)
-                self._modules[path] = _Module(path=path, mtime=mtime, mod=mod)
-                print(f"[rules] 로드: {fname}")
-            except Exception:
-                print(f"[rules] {fname} 로드 실패(스킵):", file=sys.stderr)
-                traceback.print_exc()
-        for path in list(self._modules):
-            if path not in seen:
-                del self._modules[path]
+        with self._lock:
+            for fname in files:
+                path = os.path.join(self.rules_dir, fname)
+                seen.add(path)
+                try:
+                    mtime = os.path.getmtime(path)
+                except OSError:
+                    continue
+                existing = self._modules.get(path)
+                if existing and existing.mtime == mtime:
+                    continue
+                try:
+                    spec = importlib.util.spec_from_file_location(f"rules_{fname[:-3]}", path)
+                    mod = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(mod)
+                    self._modules[path] = _Module(path=path, mtime=mtime, mod=mod)
+                    print(f"[rules] 로드: {fname}")
+                except Exception:
+                    print(f"[rules] {fname} 로드 실패(스킵):", file=sys.stderr)
+                    traceback.print_exc()
+            for path in list(self._modules):
+                if path not in seen:
+                    del self._modules[path]
 
     def _ordered_mods(self):
         self._reload()
-        return [self._modules[p].mod for p in sorted(self._modules)]
+        with self._lock:
+            return [self._modules[p].mod for p in sorted(self._modules)]
 
     def _call_first(self, hook_name: str, *args):
         for mod in self._ordered_mods():

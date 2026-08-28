@@ -81,7 +81,7 @@ except ModuleNotFoundError:
 
 import mqtt_session
 import mqtt_wire as mw
-from rules_engine import HttpResponse, RulesHandle
+from rules_engine import HttpResponse, PublishSpec, RulesHandle
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -347,6 +347,10 @@ class DeviceRegistry:
     def latest_client_id(self) -> Optional[bytes]:
         with self._lock:
             return self._latest
+
+    def list_client_ids(self) -> list:
+        with self._lock:
+            return list(self._sessions.keys())
 
 
 DEVICE_REGISTRY = DeviceRegistry()
@@ -796,6 +800,14 @@ def handle_observer_conn(client, addr, rules: RulesHandle):
         except Exception:
             log(cid, f"JSON 파싱 실패: {payload!r}")
             return None
+        if cmd.get("list"):
+            ids = [c.decode(errors="replace") for c in DEVICE_REGISTRY.list_client_ids()]
+            latest = DEVICE_REGISTRY.latest_client_id()
+            resp = json.dumps({
+                "devices": ids,
+                "latest": latest.decode(errors="replace") if latest else None,
+            }).encode()
+            return [PublishSpec(topic=b"mtap/devices", payload=resp, qos=0)]
         target_client_id = cmd.get("device_client_id", "").encode() if cmd.get("device_client_id") else None
         entry = DEVICE_REGISTRY.get(target_client_id)
         if entry is None:
