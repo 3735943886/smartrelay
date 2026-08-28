@@ -220,12 +220,6 @@ mosquitto_pub -h 127.0.0.1 -p 9883 -t mtap/cmd \
   -m '{"action":"configuration","outlet":1,"threshold_centiwatt":500,"enabled":true}'
 ```
 
-> ⚠️ **`device_control`(서버→기기 원격 제어) 봉투 구조는 이 저장소 자체 캡처로
-> 재검증된 게 아니다** — `rules/99-default.py`의 `on_local_inject()`는 별도
-> 프로젝트(MTTL-W01_Toolkit)의 2026-08-28 "LIVE-WIRE"(실기기 Voltra Cloud->device
-> 트래픽 캡처 기반) 구현을 참고해서 맞춘 것이다. 처음 실기기로 시험할 때는 반드시
-> `--observer`로 관찰하면서 할 것.
-
 기기->서버 텔레메트리(`STATUS`/`METER`/`CONFIGURATION`/`ALARM` 이벤트)는 이제
 `rules/99-default.py`가 파싱해서 client_id별로 메모리에 캐시하고(`전원 on/off`,
 `전력(W)`, `누적 에너지`, `대기전력 설정`, `알람`) 콘솔에 요약 로그를 찍는다 — 예전엔
