@@ -807,7 +807,11 @@ def handle_observer_conn(client, addr, rules: RulesHandle):
                 "devices": ids,
                 "latest": latest.decode(errors="replace") if latest else None,
             }).encode()
-            return [PublishSpec(topic=b"mtap/devices", payload=resp, qos=0)]
+            # mosquitto_pub처럼 발행 즉시 끊는 1회성 클라이언트는 같은 연결로 응답을 못
+            # 받으므로, TAP으로 브로드캐스트해서 그 순간 붙어있는 다른 observer(예:
+            # mosquitto_sub -t '#')가 받게 한다.
+            TAP.publish(b"mtap/devices", resp)
+            return None
         target_client_id = cmd.get("device_client_id", "").encode() if cmd.get("device_client_id") else None
         entry = DEVICE_REGISTRY.get(target_client_id)
         if entry is None:
