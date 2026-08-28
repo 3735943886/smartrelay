@@ -133,7 +133,7 @@ def _ca_paths(cert_dir):
     return os.path.join(cert_dir, "ca.crt"), os.path.join(cert_dir, "ca.key")
 
 
-def ensure_ca(cert_dir: str, days: int = 3650, force: bool = False):
+def ensure_ca(cert_dir: str, days: int = 7300, force: bool = False):
     ca_crt, ca_key = _ca_paths(cert_dir)
     os.makedirs(cert_dir, exist_ok=True)
     if not force and os.path.exists(ca_crt) and os.path.exists(ca_key):
@@ -161,7 +161,7 @@ def _sanitize(domain: str) -> str:
     return "".join(c if (c.isalnum() or c in ".-") else "_" for c in domain)
 
 
-def get_or_make_leaf(cert_dir: str, domain: str, days: int = 825):
+def get_or_make_leaf(cert_dir: str, domain: str, days: int = 7300):
     """domain 하나짜리 SAN 리프를 CA로 서명해서 만들고(없으면), (chain_pem, key) 경로를 돌려준다.
 
     *** RSA 고정 *** — 실기기가 TLS_RSA_WITH_AES_256_CBC_SHA256(static RSA 키교환, ECDHE 없음)
