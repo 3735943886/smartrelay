@@ -209,13 +209,29 @@ sudo python3 relay.py serve -p 443:443:<대상 도메인> -p 18831:18831:<대상
 Proxy에서도 기기의 `CONNECT`를 살짝 엿봐서 주입 대상을 확보해둔다):
 
 ```bash
+# 전원 제어 (action 생략시 기본값). outlet 0 = 전체
 mosquitto_pub -h 127.0.0.1 -p 9883 -t mtap/cmd -m '{"outlet":1,"on":true}'
+
+# 즉시 상태 보고 요청(STATUS_GET)
+mosquitto_pub -h 127.0.0.1 -p 9883 -t mtap/cmd -m '{"action":"status"}'
+
+# 대기전력 컷오프 임계값 설정(outlet 1~4만, threshold_centiwatt는 0.01W 단위)
+mosquitto_pub -h 127.0.0.1 -p 9883 -t mtap/cmd \
+  -m '{"action":"configuration","outlet":1,"threshold_centiwatt":500,"enabled":true}'
 ```
 
-> ⚠️ **`device_control`(서버→기기 원격 제어) 명령은 아직 와이어 레벨로 실증되지
-> 않았다** — `rules/99-default.py`의 `on_local_inject()`에 있는 to/fr/topic 값은
-> 펌웨어 디스어셈블(§16)로 확정한 것과 req/resp 토픽 대칭성에서 추론한 것이다.
-> 처음 시도할 때는 반드시 사람이 지켜보면서 할 것.
+> ⚠️ **`device_control`(서버→기기 원격 제어) 봉투 구조는 이 저장소 자체 캡처로
+> 재검증된 게 아니다** — `rules/99-default.py`의 `on_local_inject()`는 별도
+> 프로젝트(MTTL-W01_Toolkit)의 2026-08-28 "LIVE-WIRE"(실기기 Voltra Cloud->device
+> 트래픽 캡처 기반) 구현을 참고해서 맞춘 것이다. 처음 실기기로 시험할 때는 반드시
+> `--observer`로 관찰하면서 할 것.
+
+기기->서버 텔레메트리(`STATUS`/`METER`/`CONFIGURATION`/`ALARM` 이벤트)는 이제
+`rules/99-default.py`가 파싱해서 client_id별로 메모리에 캐시하고(`전원 on/off`,
+`전력(W)`, `누적 에너지`, `대기전력 설정`, `알람`) 콘솔에 요약 로그를 찍는다 — 예전엔
+그냥 버렸었다. 단, 주기적으로 먼저 `STATUS_GET`을 보내는 자동 폴링은 없다(기기가
+스스로 리포트할 때만 갱신) — 필요하면 위 `{"action":"status"}`를 직접 주기적으로
+호출할 것.
 
 ## 안전 수칙
 

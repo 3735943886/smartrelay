@@ -14,6 +14,7 @@ import hashlib
 import json
 import random
 import re
+import threading
 import time
 
 from rules_engine import HttpResponse, PublishSpec
@@ -22,6 +23,10 @@ from rules_engine import HttpResponse, PublishSpec
 VENDOR_CODE = "0000564"
 DEVICE_MODEL = "MTTL-W01"
 FW_VERSION_DEFAULT = "0.1.60"
+
+# 모든 캡처(다른 기기/다른 세션 포함)에서 동일하게 관측된 미들노드(MN-CSE) ID — 장치별이
+# 아니라 인프라 쪽 고정값으로 보임. device_control 봉투의 fr에 그대로 쓴다.
+MN_CSE_ID = "MN_CSE-S-7969586b38-OGSS"
 
 _B62 = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
@@ -83,6 +88,21 @@ def on_http_request(ctx, method, path, headers, body):
 
 
 # --------------------------------------------------------------------------
+# 세션별 관측 상태 — 지금까지는 부트스트랩 이후 텔레메트리(STATUS/METER/...)를 전부
+# 버렸었다. client_id별로 최소한의 상태(전원/전력/설정/알람 + device_control에 필요한
+# device_id 메타)를 기억해둔다. DB가 아니라 이 프로세스가 살아있는 동안만의 캐시다.
+# --------------------------------------------------------------------------
+
+_STATE_LOCK = threading.Lock()
+_DEVICE_STATE: dict[bytes, dict] = {}
+
+
+def _device_state(client_id: bytes) -> dict:
+    with _STATE_LOCK:
+        return _DEVICE_STATE.setdefault(client_id, {})
+
+
+# --------------------------------------------------------------------------
 # :18831 — oneM2M CSE 부트스트랩 시퀀스 (captures/ 골든 구조 그대로, ri/ct/lt만 그때그때 생성)
 # --------------------------------------------------------------------------
 
@@ -92,9 +112,22 @@ def _now() -> str:
 
 NEVER_EXPIRES = "99991231T000000"
 
+_RI_LOCK = threading.Lock()
+_RI_SEQ = random.randint(0, 89999)
+
 
 def _new_ri(ty) -> str:
-    return f"ri_{ty}_{random.randint(10000, 99999)}"
+    """리소스 ID 생성기. random.randint를 매 호출마다 새로 뽑으면(구버전) 동시 요청 시
+    이론상 충돌 가능 — 프로세스 전역 카운터로 바꿔서 충돌을 원천 차단한다."""
+    global _RI_SEQ
+    try:
+        ty_text = str(int(ty))
+    except (TypeError, ValueError):
+        ty_text = str(ty)
+    with _RI_LOCK:
+        _RI_SEQ = (_RI_SEQ + 1) % 90000
+        n = _RI_SEQ + 10000
+    return f"ri_{ty_text}_{n:05d}"
 
 
 def _reply_envelope(req: dict, pc: dict) -> dict:
@@ -134,35 +167,24 @@ def on_message(ctx, msg, topic):
         }
         return [_envelope_to_pub(ctx, _reply_envelope(msg, reply_pc))]
 
-    if rqi == "remoteCSECreate":
-        csr = dict(pc.get("m2m:csr") or {})
-        csr.update(ri=_new_ri(16), ct=_now(), lt=_now(), et=NEVER_EXPIRES)
-        return [_envelope_to_pub(ctx, _reply_envelope(msg, {"m2m:csr": csr}))]
-
-    if rqi == "accessControlPolicyCreate":
-        acp = dict(pc.get("m2m:acp") or {})
-        acp.update(ri=_new_ri(1), ct=_now(), lt=_now(), et=NEVER_EXPIRES)
-        return [_envelope_to_pub(ctx, _reply_envelope(msg, {"m2m:acp": acp}))]
-
-    if rqi == "nodeCreate":
-        nod = dict(pc.get("m2m:nod") or {})
-        nod.update(ri=_new_ri(14), ct=_now(), lt=_now(), et=NEVER_EXPIRES)
-        return [_envelope_to_pub(ctx, _reply_envelope(msg, {"m2m:nod": nod}))]
-
-    if rqi == "firmwareCreate":
-        fwr = dict(pc.get("m2m:fwr") or {})
-        fwr.update(ri=_new_ri(13), ct=_now(), lt=_now(), et=NEVER_EXPIRES)
-        return [_envelope_to_pub(ctx, _reply_envelope(msg, {"m2m:fwr": fwr}))]
-
     if rqi == "smartplugbootstrap":
         cin = pc.get("m2m:cin") or {}
         req_con = _b64_json_decode(cin.get("con"))
-        content = (req_con or {}).get("content", {}).get("device", {})
+        device = (req_con or {}).get("content", {}).get("device", {})
+        if ctx.client_id:
+            st = _device_state(ctx.client_id)
+            st["device_id"] = device.get("id") or st.get("device_id", "")
+            st["device_type"] = device.get("type", "MULTITAP")
+            st["device_model"] = DEVICE_MODEL
+            # 새 접속의 부트스트랩 — 지난 접속에서 쌓인 완전성 판단 상태는 리셋.
+            st["_status_report_seen"] = set()
+            st["status_complete"] = False
+            st["status_missing_selectors"] = sorted(_STATUS_REQUIRED_SELECTORS)
         ack = {
             "header": {
                 "version": "v2", "vendor_code": VENDOR_CODE, "api_key": "device_bootstrap",
-                "device_id": content.get("id", ""), "device_uuid": content.get("id", ""),
-                "device_type": content.get("type", "MULTITAP"), "device_model": DEVICE_MODEL,
+                "device_id": device.get("id", ""), "device_uuid": device.get("id", ""),
+                "device_type": device.get("type", "MULTITAP"), "device_model": DEVICE_MODEL,
                 "ret_code": "200", "message": "success",
                 "session_id": _session_id_for(ctx.client_id or b""),
             }
@@ -172,9 +194,31 @@ def on_message(ctx, msg, topic):
         return [_envelope_to_pub(ctx, _reply_envelope(msg, reply_pc))]
 
     if rqi.startswith("plugeventreport") or rqi.startswith("controlreport") or "control-report" in rqi:
-        return None  # 상태 리포트/ack — PUBACK만으로 충분(엔진이 이미 보냄), 응답 불필요
+        # 상태 리포트/제어 ack — 응답 PUBLISH는 불필요(PUBACK만으로 충분, 엔진이 이미 보냄).
+        # 예전엔 여기서 그냥 버렸는데, 내용을 해석해서 상태 캐시에 남겨둔다.
+        _handle_telemetry(ctx, pc)
+        return None
 
-    print(f"[rules/99-default] 미인식 rqi={rqi!r} (PUBACK만 보내고 응답 없음)")
+    try:
+        op = int(msg.get("op"))
+    except (TypeError, ValueError):
+        op = None
+    if op == 1 and pc:
+        # 범용 리소스 생성 응답 — remoteCSECreate/accessControlPolicyCreate/nodeCreate/
+        # firmwareCreate처럼 rqi별로 일일이 하드코딩하지 않고, "op=1(create) + pc 있음"이면
+        # 전부 이 자리에서 처리한다. 새 create 타입이 와도 이 파일을 안 고쳐도 됨.
+        now = _now()
+        response_pc = {}
+        for key, value in pc.items():
+            if isinstance(value, dict):
+                resource = dict(value)
+                resource.update(ri=_new_ri(msg.get("ty")), ct=now, lt=now, et=NEVER_EXPIRES)
+                response_pc[key] = resource
+            else:
+                response_pc[key] = value
+        return [_envelope_to_pub(ctx, _reply_envelope(msg, response_pc))]
+
+    print(f"[rules/99-default] 미인식 rqi={rqi!r} op={msg.get('op')!r} (PUBACK만 보내고 응답 없음)")
     return None
 
 
@@ -198,39 +242,326 @@ def _b64_json_encode(obj) -> str:
 
 
 # --------------------------------------------------------------------------
-# observer 로컬 주입 -> 실제 device_control oneM2M PUBLISH로 번역
+# 텔레메트리(기기->서버 STATUS/METER/CONFIGURATION/ALARM 이벤트) 해석
 #
-# *** 미실증 ***: §16 펌웨어 디스어셈블로 형태는 확정했지만, 이 방향(서버->기기 명령)의
-# 실제 와이어 캡처는 아직 없다. envelope의 to/fr은 req-resp 토픽 대칭성에서 추론한 것(§16.3
-# 구독 토픽 `/oneM2M/req/IN_CSE-BASE-1/{client_id}`의 fr=IN_CSE-BASE-1, to={client_id}
-# 패턴을 그대로 따름) — 처음 실기기로 시험할 때 반드시 사람이 지켜볼 것.
+# 이전엔 plugeventreport/controlreport가 오면 그냥 버렸다. 파싱 규칙 자체는 이 저장소
+# captures/로 직접 확인한 필드명(command/switchBinaryN/meterN_02/...)에 근거한다.
 # --------------------------------------------------------------------------
 
+_POWER_RE = re.compile(r"^POWER([1-4]?)_(?:EVENT|SET)$")
+_STATUS_REPORT_RE = re.compile(r"^STATUS([1-4]?)_REPORT$")
+_STATUS_EVENT_RE = re.compile(r"^STATUS([1-4]?)_EVENT$")
+_CONFIG_RE = re.compile(r"^CONFIGURATION([1-4]?)_(?:EVENT|SET|REPORT)$")
+
+_STATUS_REQUIRED_SELECTORS = frozenset(range(5))  # 0(전체 집계) + 1~4번 출력
+
+# 같은 알람 코드라도 "현재 상태"와 "방금 일어난 이벤트"의 의미가 다르다 — 0x46/0x80은
+# state로 보면 이미 정상 복귀했지만, event로 보면 "방금 복구됐다"는 전이(transition)다.
+# 하나로 합쳐버리면 이 구분이 사라져서, 지금 정상인지 방금 정상이 됐는지를 못 가른다.
+_ALARM_STATE_TABLE = {
+    0x00: "normal",
+    0x42: "overheat_trip",
+    0x44: "overheat_warning",
+    0x46: "normal",
+    0x80: "normal",
+    0x86: "overload_trip",
+    0x88: "overload_warning",
+}
+_ALARM_EVENT_TABLE = {
+    0x00: "normal",
+    0x42: "overheat_trip",
+    0x44: "overheat_warning",
+    0x46: "overheat_recovery",
+    0x80: "overload_recovery",
+    0x86: "overload_trip",
+    0x88: "overload_warning",
+}
+
+
+def _decode_alarm(raw: int) -> dict:
+    return {
+        "raw": f"{raw:02X}",
+        "state": _ALARM_STATE_TABLE.get(raw, f"unknown_0x{raw:02X}"),
+        "event": _ALARM_EVENT_TABLE.get(raw, f"unknown_0x{raw:02X}"),
+    }
+
+
+def _hex_int(value):
+    if value is None:
+        return None
+    try:
+        return int(str(value), 16)
+    except (TypeError, ValueError):
+        return None
+
+
+def _switch_bool(value):
+    raw = str(value or "").strip().upper()
+    if raw == "00":
+        return False
+    if raw == "FF":
+        return True
+    return None
+
+
+def _decode_configuration(raw):
+    s = str(raw or "").strip().upper()
+    if not re.fullmatch(r"[0-9A-F]{8}", s):
+        return None
+    threshold = int(s[:6], 16)
+    enable_byte = int(s[6:], 16)
+    if enable_byte not in (0, 1):
+        return None
+    return {"raw": s, "threshold_centiwatt": threshold, "threshold_watts": threshold / 100.0,
+            "enabled": enable_byte == 1}
+
+
+def _parse_telemetry_params(params: list) -> dict:
+    power, meter_watts, energy_raw, configuration, alarms, standby_state = {}, {}, {}, {}, {}, {}
+    malformed_switches = []
+    status_report_seen: set[int] = set()
+
+    for p in params or []:
+        if not isinstance(p, dict):
+            continue
+        cmd = str(p.get("command", ""))
+
+        m = _POWER_RE.match(cmd)
+        if m:
+            suffix = m.group(1) or ""
+            n = int(suffix or 0)
+            key = f"switchBinary{suffix}"
+            v = _switch_bool(p.get(key))
+            if v is not None:
+                power[n] = v
+                # POWER_EVENT(접미사 없음)는 물리 ALL 버튼 — 출력 1~4 전체에 동시 반영.
+                if n == 0 and cmd == "POWER_EVENT":
+                    for outlet in range(1, 5):
+                        power[outlet] = v
+            elif key in p:
+                malformed_switches.append({"command": cmd, "key": key, "value": p.get(key)})
+
+        status_report_match = _STATUS_REPORT_RE.match(cmd)
+        status_match = status_report_match or _STATUS_EVENT_RE.match(cmd)
+        if status_match:
+            suffix = status_match.group(1) or ""
+            n = int(suffix or 0)
+            if status_report_match:
+                status_report_seen.add(n)
+            key = f"switchBinary{suffix}"
+            v = _switch_bool(p.get(key))
+            if v is not None:
+                power[n] = v
+            elif key in p:
+                malformed_switches.append({"command": cmd, "key": key, "value": p.get(key)})
+
+        if cmd == "METER_CUR_STATUS_EVENT" or status_match:
+            for n in range(5):
+                key = "meter_02" if n == 0 else f"meter{n}_02"
+                raw = _hex_int(p.get(key))
+                if raw is not None:
+                    meter_watts[n] = raw / 100.0
+
+        if cmd == "METER_ACC_STATUS_EVENT":
+            for n in range(5):
+                key = "meter_00" if n == 0 else f"meter{n}_00"
+                raw = _hex_int(p.get(key))
+                if raw is not None:
+                    energy_raw[n] = raw
+
+        cm = _CONFIG_RE.match(cmd)
+        if cm:
+            suffix = cm.group(1) or ""
+            if suffix and f"configuration{suffix}" in p:
+                decoded = _decode_configuration(p[f"configuration{suffix}"])
+                if decoded:
+                    configuration[int(suffix)] = decoded
+
+        if cmd == "DEVICE_STATUS_EVENT":
+            # 출력별 대기전력(standby) 상태 — CONFIGURATION*_SET으로 컷오프를 걸어둔
+            # 출력이 실제로 대기 상태로 전환됐는지는 이 이벤트로만 알 수 있다.
+            for n in range(1, 5):
+                raw = _hex_int(p.get(f"event{n}"))
+                if raw is not None:
+                    standby_state[n] = {
+                        "raw": f"{raw:02X}",
+                        "state": "standby" if raw == 0 else "active" if raw == 1 else f"unknown_0x{raw:02X}",
+                        "active": raw == 1,
+                        "standby": raw == 0,
+                    }
+
+        if cmd == "ALARM_EVENT":
+            for n in range(5):
+                key = "event" if n == 0 else f"event{n}"
+                raw = _hex_int(p.get(key))
+                if raw is not None:
+                    alarms[n] = _decode_alarm(raw)
+
+    # 주의: 완전성(status_complete) 판단은 여기서 못 한다 — 실측상 STATUS_REPORT는
+    # 셀렉터(0~4)당 별도 PUBLISH로 하나씩 온다(한 이벤트에 5개가 다 안 들어있음). 그래서
+    # status_report_selectors는 "이번 메시지 하나"의 관측치만 돌려주고, 여러 메시지에 걸친
+    # 누적/완전성 판단은 호출자(_handle_telemetry, 세션별 상태를 들고 있음)가 한다.
+    return {
+        "power": power, "meter_watts": meter_watts, "energy_raw": energy_raw,
+        "configuration": configuration, "alarms": alarms, "standby_state": standby_state,
+        "status_report_selectors": sorted(status_report_seen),
+        "malformed_switches": malformed_switches,
+    }
+
+
+def _handle_telemetry(ctx, pc: dict):
+    cin = pc.get("m2m:cin") or {}
+    inner = _b64_json_decode(cin.get("con"))
+    if not inner:
+        return
+    content = inner.get("content") or {}
+    notif = content.get("notification") if isinstance(content.get("notification"), dict) else None
+    report = content.get("cmd_report") if isinstance(content.get("cmd_report"), dict) else None
+    if notif is not None:
+        params = notif.get("parameters")
+    elif report is not None:
+        params = report.get("parameters")
+    else:
+        params = None
+    if isinstance(params, dict):
+        params = [params]
+    if not params:
+        return
+
+    parsed = _parse_telemetry_params(params)
+    cid_str = (ctx.client_id or b"").decode(errors="replace")
+
+    if ctx.client_id:
+        st = _device_state(ctx.client_id)
+        for key in ("power", "meter_watts", "energy_raw", "configuration", "alarms", "standby_state"):
+            st.setdefault(key, {}).update(parsed.get(key) or {})
+        # STATUS_REPORT는 셀렉터당 별도 메시지로 오므로, 이번 접속에서 지금까지 본
+        # 셀렉터 집합에 계속 합집합해서 5개가 다 모였는지를 세션 단위로 판단한다.
+        # 이 집합은 smartplugbootstrap(재접속마다 다시 옴)에서 새로 초기화된다.
+        seen = st.setdefault("_status_report_seen", set())
+        seen.update(parsed["status_report_selectors"])
+        st["status_complete"] = _STATUS_REQUIRED_SELECTORS.issubset(seen)
+        st["status_missing_selectors"] = sorted(_STATUS_REQUIRED_SELECTORS - seen)
+
+    if parsed["malformed_switches"]:
+        print(f"[rules/99-default] 이상값 감지 {cid_str}: {parsed['malformed_switches']}")
+
+    summary_keys = ("power", "meter_watts", "energy_raw", "configuration", "alarms", "standby_state")
+    summary = ", ".join(f"{k}={parsed[k]}" for k in summary_keys if parsed.get(k))
+    if summary:
+        print(f"[rules/99-default] 텔레메트리 {cid_str}: {summary}")
+
+
+# --------------------------------------------------------------------------
+# observer 로컬 주입 -> 실제 device_control oneM2M PUBLISH로 번역
+#
+# 이 봉투 구조는 이 저장소 자체 캡처가 아니라 MTTL-W01_Toolkit의 2026-08-28
+# "LIVE-WIRE"(실기기 Voltra Cloud->device 트래픽 캡처 기반) 구현을 참고해서 맞춘 것이다.
+# 예전 버전(순수 추론)과 달라진 점: cmd_id가 명령 문자열이 아니라 정수(1=제어,2=상태조회),
+# inner에 header/notification 블록 필요, parameter의 command에 _SET 접미사 필요,
+# 봉투 fr이 IN_CSE-BASE-1이 아니라 미들노드(MN_CSE_ID). 이 저장소 자체 와이어로는
+# 아직 재검증 안 됐으니 처음 실기기로 시험할 때는 반드시 사람이 지켜볼 것.
+# --------------------------------------------------------------------------
+
+def _control_header(ctx, session_id: str) -> dict:
+    st = _device_state(ctx.device_client_id) if ctx.device_client_id else {}
+    device_id = st.get("device_id")
+    if not device_id:
+        # 이 세션의 smartplugbootstrap을 못 봤다(예: relay 재시작 사이 재접속) — 실제 MAC
+        # 기반 device_id를 모르니 entity 중간 세그먼트로 대체하고 경고를 남긴다.
+        cid = (ctx.device_client_id or b"").decode(errors="replace")
+        parts = cid.split("-")
+        device_id = (parts[2] if len(parts) >= 4 else cid).upper()
+        print(f"[rules/99-default] device_id 미확보(부트스트랩 미관측) — {device_id} 로 추정해서 진행")
+    return {
+        "version": "v2", "vendor_code": VENDOR_CODE, "api_key": "device_control",
+        "session_id": session_id, "device_id": device_id, "device_uuid": device_id,
+        "device_type": st.get("device_type", "MULTITAP"), "device_model": st.get("device_model", DEVICE_MODEL),
+    }, device_id
+
+
+_CTRL_LOCK = threading.Lock()
+_CTRL_SEQ = random.randint(0, 89999)
+
+
+def _new_devicecontrol_rqi() -> str:
+    """_new_ri와 같은 이유(동시 요청 충돌 방지)로 카운터 사용 — oneM2M rqi는 흔히
+    idempotency key로도 쓰이므로, 겹치면 device가 두 번째 명령을 중복으로 보고 그냥
+    무시할 위험이 있다(단순 로그 혼동보다 심각함)."""
+    global _CTRL_SEQ
+    with _CTRL_LOCK:
+        _CTRL_SEQ = (_CTRL_SEQ + 1) % 90000
+        n = _CTRL_SEQ + 10000
+    return f"devicecontrol-{n}"
+
+
+def _build_control_envelope(ctx, client_id: str, cmd_id: int, parameters: list) -> dict:
+    session_id = _session_id_for(ctx.device_client_id or b"")
+    header, device_id = _control_header(ctx, session_id)
+    inner = {
+        "header": header,
+        "type": "control-request",
+        "content": {"device": {"uuid": device_id}, "cmd_request": {"cmd_id": cmd_id, "parameters": parameters}},
+        "notification": {"noti_type": "device_control_noti_event"},
+    }
+    return {
+        "op": "1",
+        "to": f"/{client_id}",
+        "fr": f"/{MN_CSE_ID}",
+        "ty": 4,
+        "rqi": _new_devicecontrol_rqi(),
+        "pc": {"m2m:cin": {"cnf": "text/plain: 0", "con": _b64_json_encode(inner)}},
+    }
+
+
 def on_local_inject(ctx, cmd):
+    """observer로 들어온 JSON 커맨드를 device_control PUBLISH로 번역한다.
+
+    지원하는 action:
+      {"outlet": 1, "on": true}                          # action 생략시 기본 "power". outlet 0=전체
+      {"action": "power", "outlet": 1, "on": true}        # 위와 동일, 명시형
+      {"action": "status"}                                # STATUS_GET — 즉시 상태 보고 요청
+      {"action": "configuration", "outlet": 1,
+       "threshold_centiwatt": 500, "enabled": true}       # 대기전력 컷오프 임계값 설정(1~4번만)
+    """
     if not ctx.device_client_id:
         print("[rules/99-default] 주입 대상 기기 세션 없음 — 무시")
         return None
 
-    outlet = int(cmd.get("outlet", 1))
-    on = bool(cmd.get("on", False))
-    command = f"POWER{outlet}"
-    inner = {
-        "type": "control",
-        "content": {
-            "cmd_request": {
-                "cmd_id": command,
-                "parameters": [{"command": command, f"switchBinary{outlet}": "FF" if on else "00"}],
-            }
-        },
-    }
+    action = cmd.get("action", "power")
     client_id = ctx.device_client_id.decode(errors="replace")
-    envelope = {
-        "op": "1",
-        "to": f"/{client_id}",
-        "fr": "/IN_CSE-BASE-1",
-        "rqi": f"devicecontrol-{random.randint(10000, 99999)}",
-        "ty": "4",
-        "pc": {"m2m:cin": {"con": _b64_json_encode(inner)}},
-    }
+
+    if action == "status":
+        cmd_id, parameters = 2, [{"command": "STATUS_GET"}]
+
+    elif action == "configuration":
+        outlet = int(cmd.get("outlet", 1))
+        if outlet not in range(1, 5):
+            print(f"[rules/99-default] configuration outlet은 1~4만 지원(받음: {outlet}) — 무시")
+            return None
+        threshold = int(cmd.get("threshold_centiwatt", 0))
+        if not 0 <= threshold <= 0xFFFFFF:
+            print(f"[rules/99-default] threshold_centiwatt은 0~{0xFFFFFF} 범위(받음: {threshold}) — 무시")
+            return None
+        enabled = bool(cmd.get("enabled", False))
+        raw = f"{threshold:06X}{1 if enabled else 0:02X}"
+        cmd_id = 1
+        parameters = [{"command": f"CONFIGURATION{outlet}_SET", f"configuration{outlet}": raw}]
+
+    elif action == "power":
+        outlet = int(cmd.get("outlet", 1))
+        if outlet not in range(0, 5):
+            print(f"[rules/99-default] power outlet은 0(전체)~4만 지원(받음: {outlet}) — 무시")
+            return None
+        on = bool(cmd.get("on", False))
+        suffix = "" if outlet == 0 else str(outlet)
+        cmd_id = 1
+        parameters = [{"command": f"POWER{suffix}_SET", f"switchBinary{suffix}": "FF" if on else "00"}]
+
+    else:
+        print(f"[rules/99-default] 알 수 없는 action={action!r} — 무시")
+        return None
+
+    envelope = _build_control_envelope(ctx, client_id, cmd_id, parameters)
     topic = f"/oneM2M/req/IN_CSE-BASE-1/{client_id}".encode()
-    return [PublishSpec(topic=topic, payload=json.dumps(envelope).encode(), qos=1)]
+    return [PublishSpec(topic=topic, payload=json.dumps(envelope, separators=(",", ":")).encode(), qos=1)]
