@@ -193,10 +193,13 @@ def on_message(ctx, msg, topic):
                                  "con": _b64_json_encode(ack)}}
         return [_envelope_to_pub(ctx, _reply_envelope(msg, reply_pc))]
 
-    if rqi.startswith("plugeventreport") or rqi.startswith("controlreport") or "control-report" in rqi:
-        # 상태 리포트/제어 ack — 응답 PUBLISH는 불필요(PUBACK만으로 충분, 엔진이 이미 보냄).
-        # 예전엔 여기서 그냥 버렸는데, 내용을 해석해서 상태 캐시에 남겨둔다.
-        _handle_telemetry(ctx, pc)
+    if (rqi.startswith("plugeventreport") or rqi.startswith("controlreport")
+            or rqi.startswith("devicecontrol-") or "control-report" in rqi):
+        # 상태 리포트 / device_control ack(우리가 보낸 rqi를 기기가 그대로 echo — 실측
+        # 확인됨: "controlreport"/"control-report" 문자열이 rqi에 들어있는 게 아니라
+        # "devicecontrol-<우리가 붙인 번호>"를 그대로 돌려준다) — 응답 PUBLISH는 불필요
+        # (PUBACK만으로 충분, 엔진이 이미 보냄). 내용을 해석해서 상태 캐시에 남겨둔다.
+        _handle_telemetry(ctx, pc, rqi)
         return None
 
     try:
@@ -409,7 +412,7 @@ def _parse_telemetry_params(params: list) -> dict:
     }
 
 
-def _handle_telemetry(ctx, pc: dict):
+def _handle_telemetry(ctx, pc: dict, rqi: str = ""):
     cin = pc.get("m2m:cin") or {}
     inner = _b64_json_decode(cin.get("con"))
     if not inner:
@@ -417,6 +420,20 @@ def _handle_telemetry(ctx, pc: dict):
     content = inner.get("content") or {}
     notif = content.get("notification") if isinstance(content.get("notification"), dict) else None
     report = content.get("cmd_report") if isinstance(content.get("cmd_report"), dict) else None
+    cid_str = (ctx.client_id or b"").decode(errors="replace")
+
+    if report is not None:
+        # 우리가 보낸 device_control의 ack — 실측 확인: parameters 없이 result/rpt_id만
+        # 온다("성공했다"는 accept 신호일 뿐, 물리적으로 실제 바뀌었는지는 아니다 —
+        # 그건 뒤따라오는 별도 POWERn_EVENT 텔레메트리로 확인해야 함).
+        result = report.get("result")
+        if ctx.client_id:
+            _device_state(ctx.client_id)["last_cmd_report"] = {
+                "rqi": rqi, "result": result, "rpt_id": report.get("rpt_id"),
+            }
+        ok = "성공" if result == 0 else f"실패/미확인(result={result})"
+        print(f"[rules/99-default] device_control 응답 {cid_str}: rqi={rqi} {ok}")
+
     if notif is not None:
         params = notif.get("parameters")
     elif report is not None:
@@ -429,7 +446,6 @@ def _handle_telemetry(ctx, pc: dict):
         return
 
     parsed = _parse_telemetry_params(params)
-    cid_str = (ctx.client_id or b"").decode(errors="replace")
 
     if ctx.client_id:
         st = _device_state(ctx.client_id)
