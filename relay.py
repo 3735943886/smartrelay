@@ -612,9 +612,22 @@ def serve_http_locally(dev_tls, cid, ctx, rules: RulesHandle, first: bytes, fp_d
         return
     header_lines = "".join(f"{k}: {v}\r\n" for k, v in resp.headers.items())
     header_lines += f"Content-Length: {len(resp.body)}\r\n"
-    out = resp.status_line + b"\r\n" + header_lines.encode() + b"\r\n" + resp.body
-    dev_tls.sendall(out)
-    log(cid, f"rules 응답 전송 ({len(out)}B)")
+    head = resp.status_line + b"\r\n" + header_lines.encode() + b"\r\n"
+    if resp.paced:
+        # 큰 body(펌웨어 바이너리 등)를 한 번에 다 보내면 실기기가 오동작한다는 실측 보고가
+        # 있어, 헤더는 바로 보내고 body만 잘게 나눠 지연을 두고 전송한다.
+        dev_tls.sendall(head)
+        sent = 0
+        for offset in range(0, len(resp.body), 4096):
+            chunk = resp.body[offset:offset + 4096]
+            dev_tls.sendall(chunk)
+            sent += len(chunk)
+            time.sleep(0.03)
+        log(cid, f"rules 응답 전송(paced) ({len(head) + sent}B)")
+    else:
+        out = head + resp.body
+        dev_tls.sendall(out)
+        log(cid, f"rules 응답 전송 ({len(out)}B)")
 
 
 def serve_mqtt_locally(dev_tls, cid, ctx, rules: RulesHandle, first: bytes, fp_dev):

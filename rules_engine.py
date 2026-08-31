@@ -63,6 +63,8 @@ class HttpResponse:
     status_line: bytes  # e.g. b"HTTP/1.1 200 OK"
     headers: dict        # {"Content-Type": "application/xml;charset=UTF-8", ...}
     body: bytes
+    paced: bool = False  # True면 큰 body를 잘게 나눠 지연을 두고 전송(실기기가 큰 응답을
+                          # 한번에 받으면 오동작한다는 실측 보고 있음 — 펌웨어 바이너리 등)
 
 
 @dataclass

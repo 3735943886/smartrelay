@@ -13,6 +13,7 @@ import base64
 import hashlib
 import json
 import logging
+import os
 import random
 import re
 import threading
@@ -66,7 +67,112 @@ _SERIAL_RE = re.compile(rb"<deviceSerialNo>([^<]*)</deviceSerialNo>")
 # :443 POST /mef — MEF 인증 성공 응답 (구조는 captures/ 골든 그대로, 자격증명만 기기별로 발급)
 # --------------------------------------------------------------------------
 
+_OTA_PATH_RE = re.compile(rb"^/mef/(updateVersionCheck/firmware/|firmware)")
+
+# --------------------------------------------------------------------------
+# 1.0.66 복구 OTA — 공개 분석(af950833/mttl_w01)에서 확인된 정식 1.0.66 바이너리로만,
+# 그보다 낮은 버전을 보고하는 기기에 한해 제공한다. 이미 1.0.66 이상(패치된 1.0.105
+# 포함)인 기기에는 절대 권하지 않는다 — 다운그레이드는 하지 않는다는 뜻.
+# 커스텀/미검증 바이너리는 이 파일이 다루지 않는다(그건 범위 밖 — 위 저장소의
+# "patched" 경로처럼 명시적 플래그로 여는 것도 여기선 안 함).
+#
+# 활성화 방법: rules/firmware/comMTTL-W01_1.0.66.fwr 에 실제 검증된 펌웨어 파일을
+# 직접 갖다놓을 것(레포에는 벤더 바이너리를 커밋하지 않는다 — 저작권/배포 문제).
+# SHA256이 아래 값과 정확히 일치할 때만 서빙하고, 안 맞거나 파일이 없으면 절대 안 함.
+# --------------------------------------------------------------------------
+
+STABLE_OTA_VERSION = "1.0.66"
+STABLE_OTA_NAME = "comMTTL-W01_1.0.66.fwr"
+STABLE_OTA_SHA256 = "d780b578af69d52f3a05191a8e7d91a20e05085a912722327481cd5663682c04"
+
+_VERSION_CHECK_RE = re.compile(rb"^/mef/updateVersionCheck/firmware/MTAP/MTTL-W01/([0-9]+(?:\.[0-9]+)*)/?$")
+
+
+def _stable_ota_download_paths() -> set:
+    return {
+        f"/mef/firmware{STABLE_OTA_VERSION}/{STABLE_OTA_NAME}".encode(),
+        f"/mef/firmware/MTAP/20/D/{STABLE_OTA_VERSION}/{STABLE_OTA_NAME}".encode(),
+    }
+
+
+def _version_tuple(value):
+    try:
+        return tuple(int(part) for part in value.split("."))
+    except (AttributeError, ValueError):
+        return None
+
+
+_stable_ota_cache = {"checked": False, "bytes": None}
+
+
+def _stable_ota_bytes():
+    """검증된 1.0.66 바이너리를 읽어서 돌려준다. 파일 없음/해시 불일치면 None(프로세스
+    수명 동안 한 번만 확인 — 재검증하려면 relay.py를 재시작할 것)."""
+    if _stable_ota_cache["checked"]:
+        return _stable_ota_cache["bytes"]
+    _stable_ota_cache["checked"] = True
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "firmware", STABLE_OTA_NAME)
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except OSError:
+        return None
+    if hashlib.sha256(data).hexdigest() != STABLE_OTA_SHA256:
+        _log.warning("복구용 펌웨어 SHA256 불일치(%s) — 서빙 안 함", path)
+        return None
+    _stable_ota_cache["bytes"] = data
+    _log.info("복구용 펌웨어(%s) 로드+검증 완료: %s (%dB)", STABLE_OTA_VERSION, path, len(data))
+    return data
+
+
 def on_http_request(ctx, method, path, headers, body):
+    if path in _stable_ota_download_paths():
+        data = _stable_ota_bytes()
+        if data is None:
+            return HttpResponse(status_line=b"HTTP/1.1 503 Service Unavailable", headers={}, body=b"")
+        _log.info("복구용 펌웨어(%s) 전송 시작(%dB)", STABLE_OTA_VERSION, len(data))
+        return HttpResponse(
+            status_line=b"HTTP/1.1 200 OK",
+            headers={"Content-Type": "application/octet-stream"},
+            body=data, paced=True,
+        )
+
+    m = _VERSION_CHECK_RE.match(path)
+    if m:
+        current = _version_tuple(m.group(1).decode())
+        target = _version_tuple(STABLE_OTA_VERSION)
+        if current is not None and current < target and _stable_ota_bytes() is not None:
+            # 와이어 포맷 그대로(XML 아님, flat 텍스트) — chksum 값도 참고 저장소 그대로의
+            # 더미값("12345678")이다. 실제 체크섬 알고리즘은 우리도 역산 못 함 — 기기가
+            # 이 필드를 검증 안 하는 것으로 보인다는 게 그쪽 실기 확인 결과.
+            offer = (f"<vr>{STABLE_OTA_VERSION}<url>{STABLE_OTA_VERSION}"
+                     f"<fwnnam>{STABLE_OTA_NAME}<chksum>12345678").encode("ascii")
+            _log.info("복구 OTA 제안: 현재=%s -> %s", m.group(1).decode(), STABLE_OTA_VERSION)
+            return HttpResponse(
+                status_line=b"HTTP/1.1 200 OK",
+                headers={"Content-Type": "text/plain;charset=UTF-8"},
+                body=offer,
+            )
+        # 대상보다 이미 같거나 높은 버전(패치된 1.0.105 포함) — 다운그레이드 제안 안 함,
+        # 아래 공통 OTA 차단으로 흘려보낸다.
+
+    if path == b"/read_iot_wifi":
+        # QMS 진단 업로드 endpoint(공식 hdslog.lguplus.co.kr, 패치판은 log.toi.ommeq.com).
+        # 이 요청이 실패하면 기기는 5분 간격 최대 11회, 그때마다 MQTT 연결을 끊고 재접속하며
+        # 재시도한다(외부 분석 확인) — 로컬 전용 운영에선 그냥 즉시 200으로 받아주고 버려서
+        # 그 반복 재접속을 막는다.
+        _log.debug("QMS 업로드 수신 — 즉시 200 처리(내용 폐기, %dB)", len(body or b""))
+        return HttpResponse(status_line=b"HTTP/1.1 200 OK", headers={}, body=b"")
+
+    if _OTA_PATH_RE.match(path):
+        # OTA 버전체크(/mef/updateVersionCheck/firmware/...)/펌웨어 다운로드(/mef/firmware...).
+        # 이 도구는 일부러 실제 OTA를 절대 제공하지 않는다(신뢰 안 되는 바이너리를 기기에 심는
+        # 기능은 범위 밖) — 대신 "업데이트 없음"에 준하게 빈 200으로 응답해서 기기가 계속
+        # 재시도/대기하지 않게만 한다. Proxy 모드에선 이 분기를 안 타고 실서버 응답이 그대로
+        # 전달되므로 실제 OTA 지시가 보이면 README 안내대로 즉시 프로세스를 죽일 것.
+        _log.debug("OTA 요청 수신(%s) — 업데이트 없음으로 응답", path.decode(errors="replace"))
+        return HttpResponse(status_line=b"HTTP/1.1 200 OK", headers={}, body=b"")
+
     if method != b"POST" or path != b"/mef":
         return None
     m = _MAC_RE.search(body) or _SERIAL_RE.search(body)
@@ -379,11 +485,19 @@ def _parse_telemetry_params(params: list) -> dict:
                     meter_watts[n] = raw / 100.0
 
         if cmd == "METER_ACC_STATUS_EVENT":
+            # meter_00=현재 누적 카운터, premeter_00=이전/기준 누적 카운터 — "오늘/어제
+            # 사용량"이 아니라 둘 다 절대 누적값이다(외부 실측·정적분석으로 확인된 의미,
+            # 이 저장소 자체 검증은 아님). 장시간 실부하 측정 기준 1 count ≈ 1 Wh.
             for n in range(5):
-                key = "meter_00" if n == 0 else f"meter{n}_00"
-                raw = _hex_int(p.get(key))
+                meter_key = "meter_00" if n == 0 else f"meter{n}_00"
+                premeter_key = "premeter_00" if n == 0 else f"premeter{n}_00"
+                raw = _hex_int(p.get(meter_key))
+                prev = _hex_int(p.get(premeter_key))
                 if raw is not None:
-                    energy_raw[n] = raw
+                    entry = {"meter_raw": raw, "energy_wh": raw}
+                    if prev is not None:
+                        entry["premeter_raw"] = prev
+                    energy_raw[n] = entry
 
         cm = _CONFIG_RE.match(cmd)
         if cm:
@@ -478,6 +592,19 @@ def _handle_telemetry(ctx, pc: dict, rqi: str = ""):
                 diff = {k: v for k, v in new_values.items() if k == "ssid" and bucket.get(k) != v}
             else:
                 diff = {k: v for k, v in new_values.items() if bucket.get(k) != v}
+            if key == "energy_raw":
+                # 누적 카운터는 정상적으로는 감소하지 않는다 — 리셋/롤백/wrap이면 조용히
+                # 최신값으로 덮어쓰지 않고 경고를 남긴다(값 자체는 그대로 갱신 — DB로 lifetime
+                # total을 따로 관리하진 않기로 했으니 감지만 하고 보정은 안 함).
+                for outlet, entry in new_values.items():
+                    old_raw = (bucket.get(outlet) or {}).get("meter_raw")
+                    new_raw = entry.get("meter_raw")
+                    if old_raw is not None and new_raw is not None and new_raw < old_raw:
+                        _log.warning(
+                            "누적 전력량 카운터 역행 감지 %s outlet=%s: %d -> %d "
+                            "(리셋/롤백/wrap 가능성)",
+                            cid_str, outlet, old_raw, new_raw,
+                        )
             if diff:
                 changed[key] = diff
             bucket.update(new_values)
@@ -619,4 +746,8 @@ def on_local_inject(ctx, cmd):
 
     envelope = _build_control_envelope(ctx, client_id, cmd_id, parameters)
     topic = f"/oneM2M/req/IN_CSE-BASE-1/{client_id}".encode()
-    return [PublishSpec(topic=topic, payload=json.dumps(envelope, separators=(",", ":")).encode(), qos=1)]
+    # QoS0 — 실기기 펌웨어의 QoS1 packet-id/DUP 처리가 정적분석·장시간 캡처로 결함이
+    # 확인됐고(외부 분석), 우리도 packet-id 재전송/타임아웃을 구현 안 하는 fire-and-forget이라
+    # QoS1을 선언해봐야 지킬 게 없다. 성공 확인은 어차피 transport ACK가 아니라 뒤이어 오는
+    # control-report(oneM2M application ACK)로 한다(_handle_telemetry 참고).
+    return [PublishSpec(topic=topic, payload=json.dumps(envelope, separators=(",", ":")).encode(), qos=0)]

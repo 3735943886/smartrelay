@@ -111,13 +111,22 @@ def run_server_session(
             elif pkt.kind == mw.PUBLISH:
                 info = mw.parse_publish(pkt)
                 log(f"PUBLISH<- {info.topic.decode(errors='replace')} ({len(info.payload)}B, qos={info.qos})")
-                if info.qos > 0 and info.packet_id is not None:
+                # QoS1은 PUBACK 한 번으로 끝나지만 QoS2는 PUBREC/PUBREL/PUBCOMP 3-way라
+                # 둘을 같은 PUBACK으로 뭉뚱그리면 스펙 위반(기기가 재전송을 무한 반복할 수
+                # 있음) — 여기선 최소한으로 QoS2도 처리는 하되(수신 즉시 전달, PUBREL 오면
+                # PUBCOMP), 실사용 기기 트래픽은 사실상 QoS0/1뿐이라 이 경로는 방어적 코드.
+                if info.qos == 1 and info.packet_id is not None:
                     send_pkt(mw.build_puback(info.packet_id))
+                elif info.qos == 2 and info.packet_id is not None:
+                    send_pkt(mw.build_pubrec(info.packet_id))
                 if on_publish:
                     send_specs(on_publish(session, info.topic, info.payload, info.qos))
 
             elif pkt.kind == mw.PUBACK:
                 pass  # 우리가 보낸 PUBLISH에 대한 ack — 별도 처리 없음(fire-and-forget)
+
+            elif pkt.kind == mw.PUBREL:
+                send_pkt(mw.build_pubcomp(mw.parse_ack_packet_id(pkt)))
 
             elif pkt.kind == mw.PINGREQ:
                 send_pkt(mw.build_pingresp())

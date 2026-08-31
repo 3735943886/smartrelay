@@ -6,3 +6,4 @@ certs/
 captures/
 smartrelay.toml
 *.key
+rules/firmware/

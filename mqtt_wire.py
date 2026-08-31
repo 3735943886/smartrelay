@@ -99,8 +99,12 @@ class Framer:
 # --- 문자열/필드 helpers (MQTT 2바이트 길이프리픽스) ---
 
 def _read_str(buf: bytes, off: int):
+    if off + 2 > len(buf):
+        raise ValueError(f"MQTT 문자열 길이 필드 자름(offset={off}, buf={len(buf)}B)")
     n = struct.unpack_from(">H", buf, off)[0]
     off += 2
+    if off + n > len(buf):
+        raise ValueError(f"MQTT 문자열 본문 자름(offset={off}, need={n}, buf={len(buf)}B)")
     s = buf[off:off + n]
     return s, off + n
 
@@ -200,6 +204,19 @@ def build_publish(topic: bytes, payload: bytes, qos: int = 1, packet_id: Optiona
 
 def build_puback(packet_id: int) -> Packet:
     return Packet(kind=PUBACK, flags=0, body=struct.pack(">H", packet_id))
+
+
+def build_pubrec(packet_id: int) -> Packet:
+    return Packet(kind=PUBREC, flags=0, body=struct.pack(">H", packet_id))
+
+
+def build_pubcomp(packet_id: int) -> Packet:
+    return Packet(kind=PUBCOMP, flags=0, body=struct.pack(">H", packet_id))
+
+
+def parse_ack_packet_id(pkt: Packet) -> int:
+    """PUBACK/PUBREC/PUBREL/PUBCOMP 공용 — body는 2바이트 packet_id뿐."""
+    return struct.unpack_from(">H", pkt.body, 0)[0]
 
 
 @dataclass
