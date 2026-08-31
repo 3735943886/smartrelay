@@ -67,12 +67,15 @@ TLS 종단을 실제 서버로 착각한다. `relay.py`는 도메인을 미리 �
 즉 도메인을 몇 개 미리 나열할 필요가 없다 — 뭐가 오든 SNI로 배우고, 실제
 목적지는 그때그때 DNS로 찾는다.
 
-**단, SNI를 아예 안 보내는 기기가 실제로 있다.**
+**단, SNI를 아예 안 보내는 기기가 실제로 있다(MTTL-W01도 그렇다, 실측 확인됨).**
 임베디드 TLS 스택 중엔 `ClientHello`에 SNI 확장 자체를 안 넣는 경우가 흔하다.
-이러면 SNI로 도메인을 배울 수가 없어서 기본적으로 인증서 발급을 거부하고
-연결이 끊긴다. 이럴 때는 `--default-domain <도메인>`으로 SNI가 없을 때 쓸
-도메인을 직접 지정해야 한다 — 인증서 발급도 `--dns` 조회도 그 도메인으로
-처리된다.
+그리고 이런 기기는 대개 **인증서의 CN/SAN도 검증하지 않는다** — 실제로 전혀
+다른 도메인 이름으로 서명한 리프를 줘도 우리 CA로만 이어지면 그대로 신뢰하는
+걸 실기기로 확인했다. 그래서 SNI가 없으면 `relay.py`는 그냥 내부 placeholder
+도메인(`device.local`)으로 리프를 발급하고 계속 진행한다 — **`--default-domain`
+없이도 Decloud는 완전히 동작**한다. `--default-domain`은 오직 `--dns`로 **Proxy**를
+쓰면서 SNI 없는 기기를 상대할 때만 의미가 있다 — 이땐 실제 업스트림 IP를 찾으려면
+"어느 도메인을 조회할지"를 알려줘야 하기 때문이다(인증서 내용과는 무관).
 
 양방향 평문 트래픽은 연결별로 파일에 그대로
 로깅된다(`captures/<연결ID>_device_to_upstream.bin`, `..._upstream_to_device.bin`)
@@ -129,33 +132,38 @@ address=/<대상 도메인>/<relay.py를 실행하는 머신의 LAN IP>
 ### 사용법
 
 ```bash
-# 포트만 열고 관찰만 (가장 안전, --dns 없음). SNI를 보내는 기기라면 이걸로 충분.
+# 포트만 열고 관찰만 (가장 안전, --dns 없음, 도메인 지정도 필요 없음)
 python3 relay.py serve -p 443
 
-# SNI를 안 보내는 기기 — 기본 도메인을 직접 지정
-python3 relay.py serve -p 443 --default-domain <대상 도메인>
-
-# 여러 포트 동시에(예: HTTPS용 443 + MQTTS 브로커용 8883), 실제 DNS로 업스트림 찾아서 릴레이
-python3 relay.py serve -p 443 -p 8883 --default-domain <대상 도메인> --dns 8.8.8.8
+# 여러 포트 동시에, 실제 DNS로 업스트림 찾아서 릴레이(Proxy)
+python3 relay.py serve -p 443 -p 8883 --dns 8.8.8.8
 
 # 로컬에선 비표준 포트로 받고 업스트림은 표준 포트로 (LOCAL:REMOTE)
-python3 relay.py serve -p 18883:8883 --default-domain <대상 도메인> --dns 8.8.8.8
+python3 relay.py serve -p 18883:8883 --dns 8.8.8.8
 
-# 포트마다 다른 기본 도메인을 직접 붙이기(LOCAL:REMOTE:DOMAIN) — 이 포트에 한해
-# --default-domain보다 우선. 여러 서비스가 포트별로 다른 도메인을 쓸 때 유용.
-python3 relay.py serve -p 443:443:<도메인A> -p 18831:18831:<도메인B> --dns 8.8.8.8
+# SNI를 안 보내는 기기를 Proxy로 릴레이하려면(어느 도메인을 조회할지 알려줘야 함)
+python3 relay.py serve -p 443 --default-domain <대상 도메인> --dns 8.8.8.8
+
+# 포트마다 실제 업스트림 도메인이 다르면(LOCAL:REMOTE:DOMAIN) — 이 포트에 한해
+# --default-domain보다 우선. 예: MEF(:443)와 MQTT 브로커(:18831)가 서로 다른 도메인.
+python3 relay.py serve -p 443:443:<MEF 도메인> -p 18831:18831:<브로커 도메인> --dns 8.8.8.8
 
 python3 relay.py gen-ca --force      # 루트 CA만 미리 만들어두거나 강제 재생성(선택 — 자동 생성됨)
 ```
 
 `-p/--port`는 반복하거나 콤마로 여러 개 줄 수 있다. 각 항목은 `PORT`(로컬=업스트림
-같은 포트) 또는 `LOCAL:REMOTE`(로컬 포트와 실제 접속할 업스트림 포트가 다를 때).
+같은 포트), `LOCAL:REMOTE`(로컬 포트와 실제 접속할 업스트림 포트가 다를 때), 또는
+`LOCAL:REMOTE:DOMAIN`(그 포트가 SNI 없을 때 `--dns`로 조회할 도메인 — **인증서
+신뢰와는 무관**, MTTL-W01은 CN/SAN을 검증 안 하는 게 실측 확인됐으므로 이 값은
+순수하게 "Proxy에서 어느 실제 서버로 연결할지"만 결정한다).
+
 SNI를 보내는 기기라면, 같은 머신으로 여러 서브도메인(예: `a-1.a.com`,
 `a-2.a.com`)이 전부 리다이렉션돼 있어도 별도 설정 없이 자동으로 처리된다 —
 SNI로 도메인을 구분해서 도메인별로 인증서를 따로 발급하고, `--dns`로 그
-도메인마다 실제 IP를 각각 찾아서 릴레이한다. (SNI를 안 보내는 기기는
-`--default-domain`이 도메인 하나만 받으므로 이 자동 구분이 적용되지 않는다 —
-그런 기기가 여러 도메인을 쓴다면 포트/머신을 분리해서 인스턴스를 따로 띄울 것.)
+도메인마다 실제 IP를 각각 찾아서 릴레이한다. SNI를 안 보내는 기기가 포트별로
+서로 다른 실제 도메인을 쓴다면(MTTL-W01의 MEF `:443`과 MQTT 브로커 `:18831`처럼)
+`-p`의 `LOCAL:REMOTE:DOMAIN`으로 포트마다 지정할 것 — `--default-domain`은 포트별
+지정이 없을 때만 쓰이는 전역 fallback이다.
 
 ### ⚠️ 안전 — `--dns`를 지정했다면
 
@@ -163,6 +171,18 @@ SNI로 도메인을 구분해서 도메인별로 인증서를 따로 발급하�
 펌웨어/OTA 지시가 섞여 있으면 그대로 전달된다는 뜻이다 — 화면 로그를 보면서
 수상한 응답이 보이면 즉시 프로세스를 죽일 것(자동 차단은 없음). Decloud는
 우리가 rules로 직접 응답을 만드니 이 위험 자체가 없다.
+
+### ⚠️ Proxy에서 QMS 도메인은 DNS 리다이렉션하지 말 것
+
+MEF(`:443`)와 QMS 진단 업로드(예: `hdslog.lguplus.co.kr`)는 **같은 `:443` 포트,
+다른 도메인**이다. 기기가 SNI를 안 보내므로, Proxy 모드에서 `relay.py`는 그 연결이
+실제로 MEF행인지 QMS행인지 **TLS/DNS 단계에서는 구분할 수 없다** — `:443`에 설정한
+도메인(`--default-domain` 또는 `-p`의 `LOCAL:REMOTE:DOMAIN`) 하나로 무조건 조회하기
+때문에, QMS 요청까지 MEF 서버로(혹은 그 반대로) 잘못 릴레이될 수 있다. 그래서
+**Proxy로 쓸 때는 QMS 도메인을 기기용 DNS 리다이렉션 대상에서 아예 빼서, QMS
+트래픽은 relay.py를 거치지 않고 실서버로 직접 나가게 둘 것.** Decloud는 이 문제가
+없다 — TLS 종단 뒤 복호화된 HTTP 요청의 `path`(`/mef` vs `/read_iot_wifi`)로 구분해서
+같은 `:443` 리스너에서 둘 다 정확히 처리한다(`rules/99-default.py` 참고).
 
 ### 설정 파일(`smartrelay.toml`) — 앱/도커 배포용
 
@@ -191,7 +211,7 @@ HTTP(`:80`/`:443`)와 MQTT(`:18831`)를 직접 서빙한다 — 실 클라우드
 기기가 정상 동작(CSE 부트스트랩 통과, 상태 리포트 수신)한다:
 
 ```bash
-sudo python3 relay.py serve -p 443:443:<대상 도메인> -p 18831:18831:<대상 도메인> \
+sudo python3 relay.py serve -p 443 -p 18831 \
   --http-port 80 --rules-dir rules --observer 127.0.0.1:9883
 ```
 

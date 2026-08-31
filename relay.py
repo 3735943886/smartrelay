@@ -26,7 +26,11 @@ CA-swap 투명 릴레이 + rules 기반 로컬(decloud) 응답 엔진 — 완전
 observer(로컬 평문 주입 포트)만 담당한다.
 
 *** SNI를 안 보내는 기기가 실제로 있다(실측됨) ***
---default-domain 으로 SNI 없을 때 쓸 도메인을 지정할 것.
+그런 기기는 인증서의 CN/SAN도 검증 안 하는 것까지 실측 확인됨 — SNI 없으면 그냥
+FALLBACK_CERT_DOMAIN으로 발급해도 신뢰함. --default-domain/-p의 LOCAL:REMOTE:DOMAIN은
+Decloud엔 필요 없고, --dns로 Proxy를 쓰면서 SNI 없는 기기를 상대할 때(어느 도메인을
+조회할지 알려줘야 함)만 쓸 것 — 포트마다 실제 업스트림 도메인이 다르면(예: MEF vs
+QMS vs MQTT 브로커) -p의 LOCAL:REMOTE:DOMAIN으로 포트별로 줄 것.
 
 *** 전제조건: DNS 리다이렉션이 반드시 필요하다 (기기 쪽) ***
 기기가 조회하는 도메인의 DNS 응답이 "이 스크립트를 돌리는 머신의 LAN IP"로 나가야 한다.
@@ -90,6 +94,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CERT_DIR = os.path.join(SCRIPT_DIR, "certs")
 DEFAULT_RULES_DIR = os.path.join(SCRIPT_DIR, "rules")
 DEFAULT_CONFIG_NAME = "smartrelay.toml"
+FALLBACK_CERT_DOMAIN = "device.local"
 
 
 # ---------------------------------------------------------------------------
@@ -672,15 +677,14 @@ def handle_tls(raw_client, addr, local_port, remote_port, cert_dir, dns_server, 
     sni_holder = {}
 
     def sni_cb(sslsock, server_hostname, sslctx):
-        domain = server_hostname
-        if not domain:
-            fallback = port_domain or default_domain
-            if not fallback:
-                log(cid, f"SNI 없음 — :{local_port}용 기본 도메인이 없어 인증서 발급 불가"
-                         f"(포트별 도메인도 --default-domain도 없음), 연결 거부")
-                return
-            domain = fallback
-            log(cid, f"SNI 없음 — :{local_port} 기본 도메인({fallback}) 사용")
+        # 기기가 인증서의 CN/SAN을 검증하지 않는 게 실측 확인됐으므로(실제 도메인과
+        # 달라도 신뢰함), SNI가 없으면 아무 이름으로나 발급해도 TLS 신뢰엔 문제없다.
+        # 그래도 port_domain/default_domain이 있으면 그대로 써서 로그/캡처를 읽기 좋게
+        # 하고, --dns 조회에도 같은 값을 재사용한다(포트별로 실제 업스트림 도메인이
+        # 다를 수 있어서 port_domain이 default_domain보다 우선).
+        domain = server_hostname or port_domain or default_domain or FALLBACK_CERT_DOMAIN
+        if not server_hostname:
+            log(cid, f"SNI 없음 — {domain} 이름으로 인증서 발급(기기는 이름을 검증하지 않음)")
         sni_holder["value"] = domain
         chain_pem, leaf_key = get_or_make_leaf(cert_dir, domain)
         domain_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -780,7 +784,7 @@ def handle_tls(raw_client, addr, local_port, remote_port, cert_dir, dns_server, 
 
 def listen_tls(ls: socket.socket, local_port, remote_port, cert_dir, dns_server, port_domain,
                default_domain, capture_dir, rules: RulesHandle):
-    domain_note = f", SNI 없을 때 기본 도메인={port_domain}" if port_domain else ""
+    domain_note = f", --dns 조회 도메인={port_domain}" if port_domain else ""
     print(f"listening {ls.getsockname()[0]}:{local_port} — device TLS 종단"
           f"{'' if local_port == remote_port else f' (업스트림 포트는 :{remote_port})'}{domain_note}")
     sys.stdout.flush()
@@ -865,8 +869,11 @@ def listen_observer(ls: socket.socket, rules: RulesHandle):
 # ---------------------------------------------------------------------------
 
 def parse_ports(specs) -> dict:
-    """-p를 반복(또는 콤마 구분)으로 받는다. 각 항목은 'PORT', 'LOCAL:REMOTE',
-    또는 'LOCAL:REMOTE:DOMAIN'(그 포트에서 SNI 없을 때 쓸 기본 도메인) 형식.
+    """-p를 반복(또는 콤마 구분)으로 받는다. 각 항목은 'PORT', 'LOCAL:REMOTE', 또는
+    'LOCAL:REMOTE:DOMAIN' 형식. DOMAIN은 인증서 신뢰(그건 아무 이름이나 상관없는 게
+    실측 확인됨)와는 무관하고, **그 포트에서 SNI가 없을 때 --dns로 조회할 도메인**을
+    포트별로 다르게 주기 위한 것 — 같은 기기라도 서비스마다(MEF/MQTT 브로커 등)
+    실제 업스트림 도메인이 다를 수 있어서 필요하다.
     돌려주는 값: {local: {"remote": int, "domain": str|None}}."""
     ports = {}
     for spec in (specs or []):
@@ -947,9 +954,12 @@ def cmd_serve(args):
     print("DNS 리다이렉션 확인: 대상 도메인 조회가 이 머신으로 오고 있어야 동작합니다.")
     print("  (예: dnsmasq) address=/<대상 도메인>/<이 머신의 LAN IP>")
     port_summary = {local: (cfg2["remote"], cfg2["domain"]) for local, cfg2 in ports.items()}
-    print(f"리슨: :{http_port}(CA 응답) / TLS {port_summary} (local: (remote, 포트별기본도메인))")
+    print(f"리슨: :{http_port}(CA 응답) / TLS {port_summary} (local: (remote, 포트별 dns조회도메인))")
     if default_domain:
-        print(f"SNI 없는 연결의 기본 도메인: {default_domain}")
+        print(f"SNI 없는 연결의 전역 기본 도메인(포트별 지정 없을 때): {default_domain}")
+    else:
+        print(f"SNI 없는 연결: 포트별 도메인도 --default-domain도 없으면 {FALLBACK_CERT_DOMAIN}로 "
+              "인증서만 발급(--dns 쓸 거면 포트별 도메인이나 --default-domain을 지정해야 조회됨)")
     if dns:
         print(f"업스트림: --dns {dns} 로 실제 IP를 조회해서 릴레이(Proxy) — 실패시 Decloud 폴백")
         print(f"  (주의: {dns}가 기기용 DNS 리다이렉션과 같은 서버면 안 됨)")
@@ -1010,8 +1020,9 @@ def main():
         "-p", "--port", action="append", default=None,
         help="TLS로 종단할 로컬 포트. 반복 또는 콤마로 여러 개. "
              "'PORT'(로컬=업스트림 같은 포트), 'LOCAL:REMOTE'(예: 18883:8883), 또는 "
-             "'LOCAL:REMOTE:DOMAIN'(그 포트에서 SNI 없을 때 쓸 기본 도메인 지정, "
-             "--default-domain보다 우선). 예: -p 443 -p 18831:18831:example.com. "
+             "'LOCAL:REMOTE:DOMAIN'(SNI 없을 때 이 포트가 --dns로 조회할 도메인 — "
+             "인증서 신뢰와는 무관, --default-domain보다 우선). "
+             "예: -p 443:443:mef.example.com -p 18831:18831:brk.example.com. "
              "안 주면 설정 파일의 [[relay.port]]를 대신 사용.",
     )
     p_serve.add_argument(
@@ -1021,8 +1032,10 @@ def main():
     )
     p_serve.add_argument(
         "--default-domain", default=None,
-        help="ClientHello에 SNI가 없는 기기를 위한 전역 기본 도메인(인증서 발급 + --dns 조회에 "
-             "그대로 씀). -p로 그 포트의 도메인을 따로 지정하지 않은 경우의 fallback.",
+        help="ClientHello에 SNI가 없는 기기를 위한 전역 기본 도메인. 인증서 CN/SAN엔 아무 "
+             f"영향 없다(기기가 이름을 검증 안 함 — 안 주면 그냥 {FALLBACK_CERT_DOMAIN}로 발급). "
+             "--dns로 Proxy를 쓰면서 SNI 없는 기기를 상대할 때 '어느 도메인을 조회할지' "
+             "알려주는 용도(포트별로 다르면 -p의 LOCAL:REMOTE:DOMAIN을 대신 쓸 것).",
     )
     p_serve.add_argument("--rules-dir", default=None,
                           help="rules/*.py 디렉터리(빈 문자열로 주면 비활성화 — 순수 관찰/릴레이만). "

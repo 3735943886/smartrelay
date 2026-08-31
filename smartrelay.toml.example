@@ -16,8 +16,11 @@ rules_dir = "rules"
 # --dns 서버(예: 8.8.8.8). 안 주면(또는 주석 처리하면) Decloud로 동작(rules가 직접 응답).
 # dns = "8.8.8.8"
 
-# ClientHello에 SNI가 없는 기기용 전역 기본 도메인. 포트별로 다르게 주려면
-# 아래 [[relay.port]]의 domain을 쓸 것(이게 있으면 그게 우선).
+# ClientHello에 SNI가 없는 기기용 전역 기본 도메인. 인증서 CN/SAN엔 영향 없다(기기가
+# 이름을 검증 안 하는 게 실측 확인됨 — 안 주면 그냥 내부 placeholder로 발급). --dns로
+# Proxy를 쓰면서 SNI 없는 기기를 상대할 때만("어느 도메인을 조회할지") 의미가 있고,
+# 포트마다 실제 업스트림 도메인이 다르면 아래 [[relay.port]]의 domain을 대신 쓸 것
+# (있으면 그게 이 값보다 우선).
 # default_domain = "example.com"
 
 # 평문 MQTT 로컬주입 리스너(로컬신뢰망 전용, 방화벽 필수).
@@ -26,13 +29,15 @@ rules_dir = "rules"
 # 지정하면 연결별 바이트 캡처 파일을 남긴다(기본은 꺼짐).
 # capture_dir = "captures"
 
-# TLS로 종단할 로컬 포트 목록. remote/domain은 생략 가능(remote 생략시 local과 동일).
+# TLS로 종단할 로컬 포트 목록. remote는 생략 가능(생략시 local과 동일).
+# domain은 SNI 없을 때 이 포트가 --dns로 조회할 도메인(선택, 포트마다 다르게 줄 수 있음
+# — 인증서 신뢰와는 무관, Proxy에서만 의미 있음).
 [[relay.port]]
 local = 443
 remote = 443
-domain = "example.com"
+# domain = "mef.example.com"
 
 [[relay.port]]
 local = 18831
 remote = 18831
-domain = "example.com"
+# domain = "brk.example.com"
