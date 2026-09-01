@@ -337,8 +337,14 @@ class DeviceRegistry:
             self._latest = client_id
         log("registry", f"기기 세션 등록: {client_id!r}")
 
-    def unregister(self, client_id: bytes):
+    def unregister(self, client_id: bytes, sock):
+        """sock이 현재 등록된 소켓과 같을 때만 지운다. 같은 client_id로 빠르게 재접속하면
+        새 세션이 먼저 register()되고 나서야 옛 세션의 on_close가 뒤늦게 도착할 수 있는데,
+        여기서 identity를 확인 안 하면 방금 등록된 새 세션까지 지워버리게 된다(#1)."""
         with self._lock:
+            current = self._sessions.get(client_id)
+            if current is None or current[0] is not sock:
+                return
             self._sessions.pop(client_id, None)
             if self._latest == client_id:
                 self._latest = next(reversed(self._sessions), None)
@@ -659,7 +665,7 @@ def serve_mqtt_locally(dev_tls, cid, ctx, rules: RulesHandle, first: bytes, fp_d
 
     def on_close(session):
         if session.client_id:
-            DEVICE_REGISTRY.unregister(session.client_id)
+            DEVICE_REGISTRY.unregister(session.client_id, dev_tls)
 
     mqtt_session.run_server_session(
         dev_tls, cid, lambda m: log(cid, m),
@@ -750,7 +756,7 @@ def handle_tls(raw_client, addr, local_port, remote_port, cert_dir, dns_server, 
         if fp_up:
             fp_up.close()
         if tee_down.client_id:
-            DEVICE_REGISTRY.unregister(tee_down.client_id)
+            DEVICE_REGISTRY.unregister(tee_down.client_id, tee_down.dev_sock)
     else:
         # --- Decloud: 프로토콜 스니핑 후 rules로 직접 서빙 ---
         try:
